@@ -1,0 +1,509 @@
+"""Mail WebUI + API 服务。
+
+给人类：5 套美学主题的收件箱 WebUI（/）
+给 AI  ：结构化 JSON 接口（/api/...），说明见 /llms.txt 与 /api/ai/schema
+"""
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+from . import sync as syncmod
+from .imap_client import IMAPClient
+from .settings import Account, ROOT, load_account
+from .store import Store
+
+WEB_DIR = ROOT / "web"
+DEFAULT_SINCE = "2026-07-01"
+
+app = FastAPI(
+    title="Message WebUI / Mail API",
+    version="1.0.0",
+    description="IMAP 邮箱的本地 Web 阅读器与 AI 可读接口。所有 /api/* 返回 JSON。",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+_state: dict = {"account": None, "store": None, "syncing": False, "last_sync": None, "log": []}
+
+
+def account() -> Account:
+    if _state["account"] is None:
+        _state["account"] = load_account()
+    return _state["account"]
+
+
+def store() -> Store:
+    if _state["store"] is None:
+        _state["store"] = Store()
+    return _state["store"]
+
+
+def client() -> IMAPClient:
+    return IMAPClient(account())
+
+
+# ---------------------------------------------------------------- 页面 / 静态
+app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
+
+
+@app.get("/", include_in_schema=False)
+def index():
+    return FileResponse(WEB_DIR / "index.html")
+
+
+@app.get("/llms.txt", include_in_schema=False)
+def llms_txt():
+    return PlainTextResponse((WEB_DIR / "llms.txt").read_text(encoding="utf-8"), media_type="text/plain; charset=utf-8")
+
+
+@app.get("/api/ai/schema", summary="AI 接口自述：可直接照此调用")
+def ai_schema():
+    base = "/api"
+    return {
+        "service": "mail-api",
+        "account": {"email": account().email, "display_name": account().display_name},
+        "conventions": {
+            "time": "ISO8601，默认 UTC 偏移已含在字符串里；since/until 接受 'YYYY-MM-DD' 或 ISO datetime",
+            "folder": "服务端原名，如 INBOX / Sent Items / Drafts；folder 参数可重复传入",
+            "uid": "IMAP UID，仅在所属 folder 内唯一；全局 id 形如 'INBOX:1234'",
+            "pagination": "limit + offset，响应含 total",
+        },
+        "endpoints": [
+            {"method": "GET", "path": f"{base}/ai/inbox", "desc": "AI 首选：一次拿到结构化邮件列表（含清洗后的正文）",
+             "params": ["since", "until", "folder", "q", "unread_only", "has_attachment", "limit", "offset", "body_chars", "include_html"]},
+            {"method": "GET", "path": f"{base}/ai/digest", "desc": "聚合视图：按发件人/日期/主题分组统计，适合快速概览",
+             "params": ["since", "until", "folder", "q", "group_by", "top"]},
+            {"method": "GET", "path": f"{base}/messages", "desc": "信封级列表（不含正文，轻量）",
+             "params": ["folder", "since", "until", "q", "unread_only", "has_attachment", "limit", "offset", "order"]},
+            {"method": "GET", "path": f"{base}/messages/{{uid}}", "desc": "单封全文（正文 + 附件清单）",
+             "params": ["folder", "include_body", "body_format"]},
+            {"method": "GET", "path": f"{base}/messages/{{uid}}/attachment/{{index}}", "desc": "下载附件"},
+            {"method": "POST", "path": f"{base}/messages/{{uid}}/flags", "desc": "标记已读/未读、加星标",
+             "body": {"folder": "INBOX", "add": ["\\Seen"], "remove": []}},
+            {"method": "GET", "path": f"{base}/folders", "desc": "所有目录及计数 / 同步状态"},
+            {"method": "POST", "path": f"{base}/sync", "desc": "从 IMAP 增量同步到本地索引",
+             "body": {"folder": "INBOX", "since": DEFAULT_SINCE, "limit": 500, "force": False, "with_body": True}},
+            {"method": "GET", "path": f"{base}/status", "desc": "服务与索引健康状态"},
+        ],
+        "tips": [
+            "想读 7 月以来的全部邮件：GET /api/ai/inbox?since=2026-07-01&limit=200",
+            "正文默认截断到 body_chars（默认 4000）字符，需要全文再调 /api/messages/{uid}",
+            "搜索 q 会同时匹配主题、发件人、收件人和正文",
+        ],
+    }
+
+
+# ---------------------------------------------------------------- 状态
+@app.get("/api/status", summary="服务与索引状态")
+def status():
+    s = store()
+    acc = account()
+    folders = []
+    for f in s.list_folders():
+        c = s.folder_counts(f["name"])
+        folders.append(
+            {
+                "name": f["name"],
+                "total": c["total"],
+                "unread": c["unread"],
+                "uidvalidity": f["uidvalidity"],
+                "last_synced": f["last_synced"],
+                "last_error": f["last_error"],
+            }
+        )
+    return {
+        "ok": True,
+        "account": {"name": acc.name, "email": acc.email, "display_name": acc.display_name},
+        "imap": {"host": acc.imap_host, "port": acc.imap_port, "ssl": acc.imap_ssl},
+        "stats": s.stats(),
+        "folders": folders,
+        "syncing": _state["syncing"],
+        "last_sync": _state["last_sync"],
+    }
+
+
+@app.get("/api/folders", summary="目录列表与计数")
+def folders():
+    s = store()
+    known = {f["name"]: f for f in s.list_folders()}
+    try:
+        remote = {f["name"]: f for f in client().list_folders()}
+    except Exception as e:
+        remote = {}
+        _state["log"].append(f"list_folders failed: {e}")
+    out = []
+    for name in sorted(set(known) | set(remote)):
+        c = s.folder_counts(name)
+        synced = name in known
+        out.append(
+            {
+                "name": name,
+                "total": c["total"],
+                "unread": c["unread"],
+                "synced": synced,
+                "last_synced": known[name]["last_synced"] if synced else 0,
+                "flags": remote.get(name, {}).get("flags", []),
+            }
+        )
+    return {"folders": out, "count": len(out)}
+
+
+# ---------------------------------------------------------------- 同步
+class SyncRequest(BaseModel):
+    folder: str | list[str] | None = None
+    since: str | None = DEFAULT_SINCE
+    limit: int = 500
+    body_limit: int | None = None
+    force: bool = False
+    with_body: bool = True
+    all_folders: bool = False
+
+
+@app.post("/api/sync", summary="增量同步 IMAP -> 本地索引")
+def do_sync(req: SyncRequest):
+    if _state["syncing"]:
+        raise HTTPException(429, "同步正在进行中")
+    _state["syncing"] = True
+    t0 = time.time()
+    try:
+        c = client()
+        s = store()
+        if req.all_folders or req.folder is None:
+            targets = [f["name"] for f in c.list_folders()]
+        elif isinstance(req.folder, str):
+            targets = [req.folder]
+        else:
+            targets = list(req.folder)
+
+        def progress(folder: str, msg: str):
+            _state["log"].append(f"[{folder}] {msg}")
+
+        results = [
+            syncmod.sync_folder(
+                c,
+                s,
+                f,
+                since=req.since,
+                envelope_limit=req.limit,
+                body_limit=req.body_limit,
+                force=req.force,
+                with_body=req.with_body,
+                progress=progress,
+            )
+            for f in targets
+        ]
+        _state["last_sync"] = {"at": time.time(), "results": results}
+        return {
+            "ok": True,
+            "elapsed": round(time.time() - t0, 2),
+            "folders": results,
+            "new": sum(r["new"] for r in results),
+            "bodies": sum(r["bodies"] for r in results),
+            "attachments": sum(r["attachments"] for r in results),
+        }
+    except Exception as e:
+        raise HTTPException(500, f"同步失败: {e}")
+    finally:
+        _state["syncing"] = False
+
+
+# ---------------------------------------------------------------- 邮件列表 / 详情
+@app.get("/api/messages", summary="信封级邮件列表")
+def list_messages(
+    folder: list[str] | None = Query(default=None, description="可重复；默认 INBOX"),
+    since: str | None = Query(default=None, examples=["2026-07-01"]),
+    until: str | None = None,
+    q: str | None = None,
+    unread_only: bool = False,
+    has_attachment: bool | None = None,
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    order: str = "desc",
+):
+    s = store()
+    folders = folder or ["INBOX"]
+    total, items = s.list_messages(
+        folders=folders,
+        since=since,
+        until=until,
+        q=q,
+        unread_only=unread_only,
+        has_attachment=has_attachment,
+        limit=limit,
+        offset=offset,
+        order=order,
+    )
+    return {"total": total, "limit": limit, "offset": offset, "count": len(items), "items": items}
+
+
+@app.get("/api/messages/{uid}", summary="单封邮件全文")
+def get_message(
+    uid: int,
+    folder: str = "INBOX",
+    include_body: bool = True,
+    body_format: str = Query(default="both", pattern="^(text|html|both)$"),
+):
+    s = store()
+    msg = s.get_message(folder, uid)
+    if not msg:
+        raise HTTPException(404, f"未找到邮件 {folder}:{uid}（可能需要先同步）")
+    out = dict(msg)
+    if include_body:
+        body = s.get_body(folder, uid)
+        if body_format in ("text", "both"):
+            out["body_text"] = body["body_text"]
+        if body_format in ("html", "both"):
+            out["body_html"] = body["body_html"]
+        out["headers"] = body["headers"]
+    atts = s.get_attachments(folder, uid)
+    out["attachments"] = [
+        {
+            **{k: v for k, v in a.items() if k != "path"},
+            "url": f"/api/messages/{uid}/attachment/{a['index']}?folder={folder}",
+        }
+        for a in atts
+    ]
+    return out
+
+
+@app.get("/api/messages/{uid}/attachment/{index}", summary="下载附件")
+def get_attachment(uid: int, index: int, folder: str = "INBOX"):
+    s = store()
+    atts = [a for a in s.get_attachments(folder, uid) if a["index"] == index]
+    if not atts:
+        raise HTTPException(404, "附件不存在")
+    a = atts[0]
+    p = Path(a["path"]) if a["path"] else None
+    if not p or not p.exists():
+        raise HTTPException(404, "附件文件尚未落盘，请重新同步")
+    return FileResponse(p, filename=a["filename"], media_type=a["content_type"] or "application/octet-stream")
+
+
+class FlagsRequest(BaseModel):
+    folder: str = "INBOX"
+    add: list[str] = []
+    remove: list[str] = []
+
+
+@app.post("/api/messages/{uid}/flags", summary="修改标志（已读/未读/星标）")
+def set_flags(uid: int, req: FlagsRequest):
+    s = store()
+    msg = s.get_message(req.folder, uid)
+    if not msg:
+        raise HTTPException(404, "邮件不存在")
+    try:
+        flags = client().set_flags(uid, add=req.add, remove=req.remove, folder=req.folder)
+        s.set_flags(req.folder, uid, flags)
+    except Exception as e:
+        raise HTTPException(500, f"设置标志失败: {e}")
+    return {"ok": True, "uid": uid, "folder": req.folder, "flags": flags, "unread": "\\Seen" not in flags}
+
+
+@app.get("/api/search", summary="全文搜索")
+def search(
+    q: str = Query(..., min_length=1),
+    folder: list[str] | None = Query(default=None),
+    since: str | None = None,
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = 0,
+):
+    total, items = store().list_messages(folders=folder, since=since, q=q, limit=limit, offset=offset)
+    return {"query": q, "total": total, "items": items}
+
+
+# ---------------------------------------------------------------- AI 专用
+def _truncate(text: str, n: int) -> str:
+    if n <= 0 or not text or len(text) <= n:
+        return text or ""
+    return text[:n] + f"\n…（已截断，共 {len(text)} 字符，取全文请调用 /api/messages/{{uid}}）"
+
+
+@app.get("/api/ai/inbox", summary="AI 入口：结构化邮件列表（含清洗正文）")
+def ai_inbox(
+    since: str | None = Query(default=DEFAULT_SINCE, examples=["2026-07-01"]),
+    until: str | None = None,
+    folder: list[str] | None = Query(default=None, description="默认 INBOX；传 all 表示全部目录"),
+    q: str | None = None,
+    unread_only: bool = False,
+    has_attachment: bool | None = None,
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = 0,
+    body_chars: int = Query(default=4000, ge=0, le=200000),
+    include_html: bool = False,
+    order: str = "desc",
+):
+    s = store()
+    if folder is None:
+        folders = ["INBOX"]
+    elif any(f.lower() == "all" for f in folder):
+        folders = None
+    else:
+        folders = list(folder)
+
+    total, items = s.list_messages(
+        folders=folders,
+        since=since,
+        until=until,
+        q=q,
+        unread_only=unread_only,
+        has_attachment=has_attachment,
+        limit=limit,
+        offset=offset,
+        order=order,
+    )
+    out = []
+    for m in items:
+        body = s.get_body(m["folder"], m["uid"])
+        atts = s.get_attachments(m["folder"], m["uid"])
+        item = {
+            "id": m["id"],
+            "folder": m["folder"],
+            "uid": m["uid"],
+            "date": m["date"],
+            "from": m["from"],
+            "to": m["to"],
+            "cc": m["cc"],
+            "subject": m["subject"],
+            "unread": m["unread"],
+            "flags": m["flags"],
+            "snippet": m["snippet"],
+            "body_text": _truncate(body["body_text"], body_chars),
+            "attachments": [
+                {
+                    "filename": a["filename"],
+                    "content_type": a["content_type"],
+                    "size": a["size"],
+                    "url": f"/api/messages/{m['uid']}/attachment/{a['index']}?folder={m['folder']}",
+                }
+                for a in atts
+            ],
+            "url": f"/api/messages/{m['uid']}?folder={m['folder']}",
+            "web_url": f"/?folder={m['folder']}&uid={m['uid']}",
+        }
+        if include_html:
+            item["body_html"] = body["body_html"]
+        out.append(item)
+
+    return {
+        "account": account().email,
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "query": {
+            "since": since,
+            "until": until,
+            "folder": folders or "all",
+            "q": q,
+            "unread_only": unread_only,
+            "limit": limit,
+            "offset": offset,
+            "body_chars": body_chars,
+        },
+        "total": total,
+        "count": len(out),
+        "next_offset": offset + len(out) if offset + len(out) < total else None,
+        "messages": out,
+    }
+
+
+@app.get("/api/ai/digest", summary="AI 入口：按维度聚合统计")
+def ai_digest(
+    since: str | None = Query(default=DEFAULT_SINCE),
+    until: str | None = None,
+    folder: list[str] | None = Query(default=None),
+    q: str | None = None,
+    group_by: str = Query(default="sender", pattern="^(sender|date|subject|folder)$"),
+    top: int = Query(default=20, ge=1, le=200),
+):
+    s = store()
+    folders = None if folder and any(f.lower() == "all" for f in folder) else (list(folder) if folder else ["INBOX"])
+    _, items = s.list_messages(folders=folders, since=since, until=until, q=q, limit=5000, order="desc")
+
+    def key(m: dict) -> str:
+        if group_by == "sender":
+            return f'{m["from"]["name"]} <{m["from"]["email"]}>'
+        if group_by == "date":
+            return (m["date"] or "")[:10]
+        if group_by == "folder":
+            return m["folder"]
+        import re as _re
+
+        return _re.sub(r"^(re|fw|fwd)\s*[:：]\s*", "", (m["subject"] or ""), flags=_re.I).strip().lower()
+
+    buckets: dict[str, dict] = {}
+    for m in items:
+        k = key(m)
+        b = buckets.setdefault(k, {"key": k, "count": 0, "unread": 0, "with_attachment": 0, "latest": "", "samples": []})
+        b["count"] += 1
+        b["unread"] += 1 if m["unread"] else 0
+        b["with_attachment"] += 1 if m["has_attachment"] else 0
+        if (m["date"] or "") > b["latest"]:
+            b["latest"] = m["date"] or ""
+        if len(b["samples"]) < 3:
+            b["samples"].append({"id": m["id"], "date": m["date"], "subject": m["subject"], "snippet": m["snippet"][:120]})
+
+    groups = sorted(buckets.values(), key=lambda x: x["count"], reverse=True)[:top]
+    return {
+        "account": account().email,
+        "query": {"since": since, "until": until, "folder": folders or "all", "q": q, "group_by": group_by},
+        "total_messages": len(items),
+        "group_count": len(groups),
+        "groups": groups,
+    }
+
+
+@app.get("/api/ai/verify", summary="校验：指定时间窗内各目录的邮件数量与日期范围")
+def ai_verify(since: str = Query(default=DEFAULT_SINCE), folder: list[str] | None = Query(default=None)):
+    s = store()
+    folders = None if folder and any(f.lower() == "all" for f in folder) else (list(folder) if folder else None)
+    if folders is None:
+        folders = [f["name"] for f in s.list_folders()]
+    out = []
+    total = 0
+    with_body = 0
+    for f in folders:
+        total_, items = s.list_messages(folders=[f], since=since, limit=100000)
+        bodies = s.conn.execute(
+            "SELECT COUNT(*) AS c FROM messages m JOIN bodies b ON b.folder=m.folder AND b.uid=m.uid "
+            "WHERE m.folder=? AND m.date_ts>=?",
+            (f, s._ts(since)),
+        ).fetchone()["c"]
+        dates = [i["date"] for i in items if i["date"]]
+        out.append(
+            {
+                "folder": f,
+                "count": total_,
+                "with_body": bodies,
+                "oldest": min(dates) if dates else None,
+                "newest": max(dates) if dates else None,
+                "attachments": s.conn.execute(
+                    "SELECT COUNT(*) AS c FROM attachments a JOIN messages m ON m.folder=a.folder AND m.uid=a.uid "
+                    "WHERE m.folder=? AND m.date_ts>=?",
+                    (f, s._ts(since)),
+                ).fetchone()["c"],
+            }
+        )
+        total += total_
+        with_body += bodies
+    return {"since": since, "total": total, "with_body": with_body, "folders": out}
+
+
+@app.on_event("shutdown")
+def _shutdown():
+    if _state["store"] is not None:
+        try:
+            _state["store"].conn.close()
+        except Exception:
+            pass

@@ -1,0 +1,43 @@
+# 邮件阅读器 · AI 可读接口（llms.txt）
+
+本服务是本地 IMAP 邮箱的阅读器，同时对外提供结构化 JSON 接口，供 AI / 脚本直接读取邮件。
+基础地址：http://127.0.0.1:8765
+交互式文档：/docs   接口自述：/api/ai/schema
+
+## 约定
+
+- 所有 /api/* 返回 JSON（UTF-8），时间字段为 ISO 8601。
+- `folder` 使用服务端原名（INBOX / Sent Items / Drafts …），可重复传入；传 `all` 表示全部目录。
+- `uid` 是 IMAP UID，仅在所属 folder 内唯一；全局 id 形如 `INBOX:1234`。
+- `since` / `until` 接受 `YYYY-MM-DD` 或 ISO datetime；分页用 `limit`（上限 500）+ `offset`。
+
+## 推荐调用顺序
+
+1. `GET /api/status`                 确认服务与索引状态
+2. `POST /api/sync` `{"all_folders": true, "since": "2026-07-01"}`   把邮件拉到本地索引（幂等、增量）
+3. `GET /api/ai/inbox?since=2026-07-01&limit=100`                    读结构化邮件（默认含清洗后的正文，截断 4000 字符）
+4. `GET /api/messages/{uid}?folder=INBOX`                            取单封全文与附件清单
+5. `GET /api/ai/digest?since=2026-07-01&group_by=sender`             按发件人/日期聚合，用于概览
+
+## 端点清单
+
+- GET  /api/status                       服务、账号、各目录计数与同步时间
+- GET  /api/folders                      目录列表（含总数/未读数）
+- POST /api/sync                         增量同步；body: {folder|all_folders, since, limit, force, with_body}
+- GET  /api/messages                     信封列表；参数 folder/since/until/q/unread_only/has_attachment/limit/offset/order
+- GET  /api/messages/{uid}               单封全文；参数 folder/include_body/body_format=text|html|both
+- GET  /api/messages/{uid}/attachment/{index}   下载附件
+- POST /api/messages/{uid}/flags         改标志；body: {folder, add:["\\Seen"], remove:[]}
+- GET  /api/search?q=...                 全文搜索（主题/发件人/收件人/正文）
+- GET  /api/ai/inbox                     AI 主入口：结构化列表，参数 since/until/folder/q/unread_only/limit/offset/body_chars/include_html
+- GET  /api/ai/digest                    聚合统计；group_by=sender|date|subject|folder
+- GET  /api/ai/schema                    机器可读的接口自述（与本文等价）
+- GET  /api/ai/verify?since=2026-07-01   校验时间窗内各目录数量、日期范围、附件数
+
+## 示例
+
+读取 2026 年 7 月 1 日以来全部邮件（正文截断 4000 字符）：
+
+    curl "http://127.0.0.1:8765/api/ai/inbox?since=2026-07-01&folder=all&limit=200"
+
+Web 界面：http://127.0.0.1:8765/  （支持 5 套主题：宣纸水墨 / 瑞士极简 / 暗夜霓虹 / 复古终端 / 琉璃柔彩）

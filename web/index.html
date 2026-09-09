@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="ink">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>信箱 · Mail WebUI</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">✉</span>
+      <div>
+        <h1>信箱</h1>
+        <p class="account" id="account">加载中…</p>
+      </div>
+    </div>
+
+    <div class="search-wrap">
+      <input class="input" id="search" type="search" placeholder="搜索主题 / 发件人 / 正文…（按 / 聚焦）" autocomplete="off">
+      <select class="select" id="range">
+        <option value="2026-07-01">7 月以来</option>
+        <option value="d30">最近 30 天</option>
+        <option value="d7">最近 7 天</option>
+        <option value="all">全部时间</option>
+      </select>
+    </div>
+
+    <div class="actions">
+      <button class="btn" id="unreadBtn" title="只看未读">未读</button>
+      <button class="btn btn-primary" id="syncBtn">同步</button>
+      <div class="theme-picker">
+        <button class="btn" id="themeBtn">主题 · <span id="themeName">宣纸水墨</span> ▾</button>
+        <div class="theme-menu" id="themeMenu"></div>
+      </div>
+    </div>
+  </header>
+
+  <main class="layout">
+    <aside class="sidebar">
+      <div class="side-title">目录</div>
+      <ul id="folders"></ul>
+      <div class="side-stats" id="stats"></div>
+    </aside>
+
+    <section class="list-pane">
+      <div class="list-head">
+        <span class="list-head-title" id="listTitle">收件箱</span>
+        <span class="list-head-count" id="listCount"></span>
+      </div>
+      <div class="list" id="messageList"><div class="empty">加载中…</div></div>
+      <div class="list-foot"><button class="btn" id="moreBtn">加载更多</button></div>
+    </section>
+
+    <section class="reader" id="reader">
+      <div class="empty">选择一封邮件开始阅读</div>
+    </section>
+  </main>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
