@@ -21,7 +21,8 @@
     items: [],
     current: null,
     folders: [],
-    bodyMode: "text",
+    bodyMode: "rich",       // rich | text | source
+    showExternal: false,    // 是否显示外链图片（防追踪，默认屏蔽）
   };
 
   const $ = (sel) => document.querySelector(sel);
@@ -240,6 +241,7 @@
     try {
       const m = await api(`/api/messages/${uid}?folder=${encodeURIComponent(folder)}&include_body=true&body_format=both`);
       state.current = m;
+      state.showExternal = false;
       renderReader(m);
       if (m.unread) {
         fetch(`/api/messages/${uid}/flags`, {
@@ -256,27 +258,176 @@
     }
   }
 
+  /* ------------------------------ 正文渲染：富文本 ------------------------------ */
+  // 直接丢掉的标签（脚本 / 样式 / 外嵌对象 / 表单）
+  const DROP_TAGS = [
+    "SCRIPT", "STYLE", "NOSCRIPT", "IFRAME", "OBJECT", "EMBED", "LINK", "META", "BASE",
+    "FORM", "INPUT", "BUTTON", "SELECT", "TEXTAREA", "SVG", "MATH", "APPLET",
+    "FRAME", "FRAMESET", "AUDIO", "VIDEO", "SOURCE", "TRACK", "CANVAS", "MAP", "AREA", "TITLE",
+  ];
+
+  // 保留内容、只剥掉标签的白名单（邮件排版主要靠 table / 内联样式）
+  const KEEP_TAGS = new Set([
+    "A", "ABBR", "ADDRESS", "ARTICLE", "ASIDE", "B", "BIG", "BLOCKQUOTE", "BR", "CAPTION", "CENTER",
+    "CODE", "COL", "COLGROUP", "DD", "DEL", "DETAILS", "DIV", "DL", "DT", "EM", "FIGURE", "FIGCAPTION",
+    "FONT", "FOOTER", "H1", "H2", "H3", "H4", "H5", "H6", "HEADER", "HR", "I", "IMG", "INS", "KBD",
+    "LABEL", "LI", "MAIN", "MARK", "NAV", "OL", "P", "PRE", "Q", "S", "SAMP", "SECTION", "SMALL",
+    "SPAN", "STRIKE", "STRONG", "SUB", "SUMMARY", "SUP", "TABLE", "TBODY", "TD", "TFOOT", "TH",
+    "THEAD", "TIME", "TR", "TT", "U", "UL", "VAR",
+  ]);
+
+  const ATTR_ALL = new Set([
+    "style", "class", "id", "title", "lang", "dir", "role",
+    "align", "valign", "colspan", "rowspan", "nowrap", "width", "height",
+    "bgcolor", "border", "cellpadding", "cellspacing", "size", "color", "face",
+    "cite", "datetime", "start", "type", "scope", "summary", "span",
+  ]);
+  const ATTR_BY_TAG = {
+    A: new Set(["href", "target", "rel", "name"]),
+    IMG: new Set(["src", "alt", "width", "height", "border", "align", "hspace", "vspace", "loading"]),
+  };
+
+  function sanitizeStyle(v) {
+    let s = String(v || "");
+    s = s.replace(/expression\s*\(/gi, "");
+    s = s.replace(/javascript\s*:/gi, "");
+    s = s.replace(/vbscript\s*:/gi, "");
+    s = s.replace(/-moz-binding\s*:/gi, "");
+    // 远程背景图属于追踪像素，直接去掉
+    s = s.replace(/url\s*\(\s*['"]?\s*(?:https?:)?\/\/[^)]*\)/gi, "");
+    // 防止邮件样式盖住整个界面
+    s = s.replace(/position\s*:\s*(fixed|absolute)\s*;?/gi, "");
+    s = s.replace(/z-index\s*:\s*[^;]*;?/gi, "");
+    return s;
+  }
+
+  function sanitizeHtml(html) {
+    const doc = new DOMParser().parseFromString(String(html || ""), "text/html");
+    doc.querySelectorAll(DROP_TAGS.join(",")).forEach((n) => n.remove());
+
+    const walk = (parent) => {
+      Array.from(parent.children).forEach((child) => {
+        const tag = child.tagName;
+        if (!KEEP_TAGS.has(tag)) {
+          // 不在白名单：保留文字内容，剥掉标签本身
+          const frag = doc.createDocumentFragment();
+          while (child.firstChild) frag.appendChild(child.firstChild);
+          child.replaceWith(frag);
+          return;
+        }
+        Array.from(child.attributes).forEach((a) => {
+          const n = a.name.toLowerCase();
+          if (n.indexOf("on") === 0) { child.removeAttribute(a.name); return; }
+          const ok = (ATTR_BY_TAG[tag] && ATTR_BY_TAG[tag].has(n)) || ATTR_ALL.has(n);
+          if (!ok) { child.removeAttribute(a.name); return; }
+          if (n === "style") child.setAttribute("style", sanitizeStyle(a.value));
+          if ((n === "href" || n === "src") && /^\s*(javascript|vbscript|data:text\/html)\s*:/i.test(a.value)) {
+            child.removeAttribute(a.name);
+          }
+        });
+        if (tag === "A") {
+          child.setAttribute("target", "_blank");
+          child.setAttribute("rel", "noopener noreferrer");
+        }
+        walk(child);
+      });
+    };
+    walk(doc.body);
+    return doc.body.innerHTML;
+  }
+
+  function cidMap(m) {
+    const map = {};
+    (m.inline_images || []).forEach((a) => {
+      const cid = String(a.content_id || "").replace(/[<>]/g, "").toLowerCase();
+      if (cid) {
+        map[cid] = a;
+        map[cid.split("@")[0]] = a;
+        map[cid.split("@")[0].split("$")[0]] = a;
+      }
+      if (a.filename) map[String(a.filename).toLowerCase()] = a;
+    });
+    return map;
+  }
+
+  /** 纯文本正文 -> HTML：把 [cid:xxx] 占位还原成真实图片 */
+  function textToHtml(text, m) {
+    const map = cidMap(m);
+    let s = String(text || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+    s = s.replace(/\[\s*cid:([^\]\s]+)\s*\]/gi, (full, cid) => {
+      const a = map[cid.toLowerCase()] || map[cid.split("@")[0].toLowerCase()];
+      if (!a) return "";
+      return `<img class="inline-img" src="${a.inline_url}" alt="${a.filename}">`;
+    });
+    s = s.replace(/(https?:\/\/[^\s<>"']+)/gi, '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>');
+    return s.replace(/\n/g, "<br>");
+  }
+
+  /** 外链图片默认屏蔽（防追踪），未匹配的 cid 也占位，可加载的本地 cid 直接显示 */
+  function applyImagePolicy(root) {
+    let blocked = 0;
+    root.querySelectorAll("img").forEach((img) => {
+      const src = img.getAttribute("src") || "";
+      if (/^https?:/i.test(src)) {
+        blocked++;
+        if (state.showExternal) {
+          img.setAttribute("referrerpolicy", "no-referrer");
+        } else {
+          const ph = el("span", "ext-img");
+          ph.dataset.src = src;
+          ph.title = src;
+          img.replaceWith(ph);
+        }
+      } else if (/^cid:/i.test(src)) {
+        // 后端没找到匹配的 cid（极少见：邮件引用了不在 multipart 里的图）
+        const ph = el("span", "ext-img");
+        ph.textContent = "🖼 引用了未随邮件发送的图片";
+        img.replaceWith(ph);
+      } else {
+        img.classList.add("inline-img");
+        img.setAttribute("loading", "lazy");
+      }
+    });
+    return blocked;
+  }
+
   function renderReader(m) {
     const reader = $("#reader");
     reader.innerHTML = "";
 
+    const hasHtml = !!(m.body_html && m.body_html.trim());
+    const hasText = !!(m.body_text && m.body_text.trim());
+    let mode = state.bodyMode;
+    if (mode === "source" && !hasHtml) mode = "rich";
+
     const bar = el("div", "reader-bar");
     const seg = el("div", "seg");
-    const bText = el("button", state.bodyMode === "text" ? "active" : "", "纯文本");
-    const bHtml = el("button", state.bodyMode === "html" ? "active" : "", "原始排版");
-    bText.onclick = () => { state.bodyMode = "text"; renderReader(m); };
-    bHtml.onclick = () => { state.bodyMode = "html"; renderReader(m); };
-    seg.appendChild(bText); seg.appendChild(bHtml);
+    [
+      ["rich", "富文本", true],
+      ["text", "纯文本", hasText],
+      ["source", "源码", hasHtml],
+    ].forEach(([id, label, enabled]) => {
+      const b = el("button", mode === id ? "active" : "", label);
+      b.disabled = !enabled;
+      if (!enabled) b.style.opacity = "0.35";
+      b.onclick = () => { state.bodyMode = id; renderReader(m); };
+      seg.appendChild(b);
+    });
     bar.appendChild(seg);
 
-    const hasHtml = !!(m.body_html && m.body_html.trim());
-    bHtml.disabled = !hasHtml;
-    bHtml.style.opacity = hasHtml ? "" : "0.4";
+    const extBtn = el("button", "btn", "");
+    extBtn.style.display = "none";
+    extBtn.onclick = () => { state.showExternal = !state.showExternal; renderReader(m); };
+    bar.appendChild(extBtn);
 
     const unreadBtn = el("button", "btn", m.unread ? "标记已读" : "标记未读");
     unreadBtn.onclick = () => toggleUnread(m, unreadBtn);
     bar.appendChild(unreadBtn);
     bar.appendChild(el("div", "spacer"));
+    if (m.inline_count) bar.appendChild(el("span", "attach-size", `内嵌 ${m.inline_count} 张`));
     bar.appendChild(el("span", "attach-size", `UID ${m.uid} · ${fmtBytes(m.size)}`));
     reader.appendChild(bar);
 
@@ -298,6 +449,7 @@
     addRow("目录", folderLabel(m.folder));
     inner.appendChild(meta);
 
+    // 只列真实附件；内嵌图片已经渲染在正文里，不再重复列出
     if (m.attachments && m.attachments.length) {
       const box = el("div", "attach-list");
       m.attachments.forEach((a) => {
@@ -310,20 +462,36 @@
         box.appendChild(chip);
       });
       inner.appendChild(box);
+    } else if (m.inline_count) {
+      inner.appendChild(el("div", "attach-note", `${m.inline_count} 张内嵌图片已显示在正文中`));
     }
 
     const body = el("div", "reader-body");
-    if (state.bodyMode === "html" && hasHtml) {
+    if (mode === "rich") body.classList.add("rich");
+    if (mode === "source") {
       const f = document.createElement("iframe");
       f.className = "body-html-frame";
       f.setAttribute("sandbox", "");
       f.srcdoc = m.body_html;
       body.appendChild(f);
-    } else {
+    } else if (mode === "text") {
       const pre = el("pre", "body-text");
       pre.textContent = (m.body_text || "").trim() || "（此邮件没有纯文本正文）";
       body.appendChild(pre);
+    } else if (hasHtml) {
+      body.innerHTML = sanitizeHtml(m.body_html);
+    } else {
+      body.innerHTML = textToHtml(m.body_text, m);
     }
+
+    if (mode === "rich") {
+      const blocked = applyImagePolicy(body);
+      if (blocked) {
+        extBtn.style.display = "";
+        extBtn.textContent = state.showExternal ? "隐藏外部图片" : `显示 ${blocked} 张外部图片`;
+      }
+    }
+
     inner.appendChild(body);
     reader.appendChild(inner);
     inner.scrollTop = 0;
@@ -447,7 +615,24 @@
 
     bind();
     loadStatus();
-    loadFolders().then(() => loadMessages(false));
+
+    // 支持 /?folder=INBOX&uid=123 直达某封邮件（API 里的 web_url 就指向这里）
+    const params = new URLSearchParams(location.search);
+    const folderParam = params.get("folder");
+    const uidParam = params.get("uid");
+    if (folderParam) state.folder = folderParam;
+
+    loadFolders()
+      .then(() => loadMessages(false))
+      .then(() => {
+        if (uidParam) {
+          const uid = parseInt(uidParam, 10);
+          if (!isNaN(uid)) {
+            const row = document.querySelector(`.msg-row[data-uid="${uid}"]`);
+            openMessage(state.folder, uid, row);
+          }
+        }
+      });
   }
 
   document.addEventListener("DOMContentLoaded", init);

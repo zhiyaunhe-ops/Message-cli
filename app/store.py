@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS attachments (
     size INTEGER DEFAULT 0,
     path TEXT DEFAULT '',
     is_inline INTEGER DEFAULT 0,
+    content_id TEXT DEFAULT '',
     PRIMARY KEY (folder, uid, idx)
 );
 CREATE TABLE IF NOT EXISTS meta (
@@ -77,8 +78,17 @@ class Store:
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.executescript(SCHEMA)
         self.conn.commit()
+        self._migrate()
 
     # ---------- 基础 ----------
+    def _migrate(self) -> None:
+        """给早期建好的表补列（CREATE TABLE IF NOT EXISTS 不会加列）。"""
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(attachments)")}
+        if "content_id" not in cols:
+            with self._lock:
+                self.conn.execute("ALTER TABLE attachments ADD COLUMN content_id TEXT DEFAULT ''")
+                self.conn.commit()
+
     def _exec(self, sql: str, params=()):
         with self._lock:
             cur = self.conn.execute(sql, params)
@@ -156,9 +166,10 @@ class Store:
 
     def add_attachment(self, folder: str, uid: int, att: dict) -> None:
         self._exec(
-            "INSERT INTO attachments(folder,uid,idx,filename,content_type,size,path,is_inline) VALUES(?,?,?,?,?,?,?,?) "
+            "INSERT INTO attachments(folder,uid,idx,filename,content_type,size,path,is_inline,content_id) "
+            "VALUES(?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(folder,uid,idx) DO UPDATE SET filename=excluded.filename, content_type=excluded.content_type, "
-            "size=excluded.size, path=excluded.path, is_inline=excluded.is_inline",
+            "size=excluded.size, path=excluded.path, is_inline=excluded.is_inline, content_id=excluded.content_id",
             (
                 folder,
                 uid,
@@ -168,6 +179,7 @@ class Store:
                 att["size"],
                 att.get("path", ""),
                 1 if att.get("is_inline") else 0,
+                att.get("content_id") or "",
             ),
         )
 
@@ -264,6 +276,7 @@ class Store:
                 "size": r["size"],
                 "path": r["path"],
                 "is_inline": bool(r["is_inline"]),
+                "content_id": r["content_id"] or "",
             }
             for r in rows
         ]

@@ -6,8 +6,10 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -105,6 +107,54 @@ def ai_schema():
             "搜索 q 会同时匹配主题、发件人、收件人和正文",
         ],
     }
+
+
+# ---------------------------------------------------------------- 内嵌资源
+_CID_RE = re.compile(r"""(?i)(?:cid:|["']cid:)([^\s"'<>)\]]+)""")
+
+
+def att_url(folder: str, uid: int, index: int, disposition: str = "inline") -> str:
+    return f"/api/messages/{uid}/attachment/{index}?folder={quote(folder, safe='')}&disposition={disposition}"
+
+
+def resolve_cids(html: str, folder: str, uid: int, atts: list[dict]) -> str:
+    """把正文里的 cid: 引用替换成指向本地附件的 URL，让内嵌图片直接显示在正文中。"""
+    if not html or "cid:" not in html.lower():
+        return html
+    by_cid: dict[str, dict] = {}
+    for a in atts:
+        cid = (a.get("content_id") or "").strip().strip("<>")
+        if cid:
+            by_cid[cid.lower()] = a
+            by_cid[cid.split("@")[0].lower()] = a
+        if a.get("filename"):
+            by_cid[a["filename"].lower()] = a
+
+    def repl(m: re.Match) -> str:
+        cid = m.group(1).strip()
+        a = by_cid.get(cid.lower()) or by_cid.get(cid.split("@")[0].lower())
+        if not a:
+            return m.group(0)
+        return att_url(folder, uid, a["index"], "inline")
+
+    return _CID_RE.sub(repl, html)
+
+
+def split_attachments(atts: list[dict], folder: str, uid: int) -> tuple[list[dict], list[dict]]:
+    """拆成「真实附件」与「内嵌资源（签名 logo / 插图等，已渲染进正文）」。"""
+    real, inline = [], []
+    for a in atts:
+        item = {
+            "filename": a["filename"],
+            "content_type": a["content_type"],
+            "size": a["size"],
+            "is_inline": bool(a["is_inline"]),
+            "content_id": a.get("content_id") or "",
+            "url": att_url(folder, uid, a["index"], "attachment"),
+            "inline_url": att_url(folder, uid, a["index"], "inline"),
+        }
+        (inline if a["is_inline"] or a.get("content_id") else real).append(item)
+    return real, inline
 
 
 # ---------------------------------------------------------------- 状态
@@ -262,26 +312,25 @@ def get_message(
     if not msg:
         raise HTTPException(404, f"未找到邮件 {folder}:{uid}（可能需要先同步）")
     out = dict(msg)
+    atts = s.get_attachments(folder, uid)
+    real, inline = split_attachments(atts, folder, uid)
     if include_body:
         body = s.get_body(folder, uid)
         if body_format in ("text", "both"):
             out["body_text"] = body["body_text"]
         if body_format in ("html", "both"):
-            out["body_html"] = body["body_html"]
+            # cid: 已替换为可直接引用的 URL，前端可直接把这段 HTML 渲染进正文
+            out["body_html"] = resolve_cids(body["body_html"], folder, uid, atts)
         out["headers"] = body["headers"]
-    atts = s.get_attachments(folder, uid)
-    out["attachments"] = [
-        {
-            **{k: v for k, v in a.items() if k != "path"},
-            "url": f"/api/messages/{uid}/attachment/{a['index']}?folder={folder}",
-        }
-        for a in atts
-    ]
+    out["attachments"] = real          # 真实附件（下载用）
+    out["inline_images"] = inline      # 内嵌资源（已渲染进正文，不单独列出）
+    out["attachment_count"] = len(real)
+    out["inline_count"] = len(inline)
     return out
 
 
 @app.get("/api/messages/{uid}/attachment/{index}", summary="下载附件")
-def get_attachment(uid: int, index: int, folder: str = "INBOX"):
+def get_attachment(uid: int, index: int, folder: str = "INBOX", disposition: str = "attachment"):
     s = store()
     atts = [a for a in s.get_attachments(folder, uid) if a["index"] == index]
     if not atts:
@@ -290,7 +339,9 @@ def get_attachment(uid: int, index: int, folder: str = "INBOX"):
     p = Path(a["path"]) if a["path"] else None
     if not p or not p.exists():
         raise HTTPException(404, "附件文件尚未落盘，请重新同步")
-    return FileResponse(p, filename=a["filename"], media_type=a["content_type"] or "application/octet-stream")
+    # disposition=inline 用于正文里的 <img src>，不带 filename 浏览器才会直接显示
+    fname = None if disposition == "inline" else a["filename"]
+    return FileResponse(p, filename=fname, media_type=a["content_type"] or "application/octet-stream")
 
 
 class FlagsRequest(BaseModel):
@@ -344,6 +395,7 @@ def ai_inbox(
     offset: int = 0,
     body_chars: int = Query(default=4000, ge=0, le=200000),
     include_html: bool = False,
+    include_inline: bool = Query(default=False, description="内嵌图片（签名 logo 等）是否列入 attachments"),
     order: str = "desc",
 ):
     s = store()
@@ -369,6 +421,8 @@ def ai_inbox(
     for m in items:
         body = s.get_body(m["folder"], m["uid"])
         atts = s.get_attachments(m["folder"], m["uid"])
+        real, inline = split_attachments(atts, m["folder"], m["uid"])
+        listed = real + inline if include_inline else real
         item = {
             "id": m["id"],
             "folder": m["folder"],
@@ -382,20 +436,23 @@ def ai_inbox(
             "flags": m["flags"],
             "snippet": m["snippet"],
             "body_text": _truncate(body["body_text"], body_chars),
+            # 默认只列真实附件；内嵌图片已在正文里渲染，对 AI 也是噪声
             "attachments": [
                 {
                     "filename": a["filename"],
                     "content_type": a["content_type"],
                     "size": a["size"],
-                    "url": f"/api/messages/{m['uid']}/attachment/{a['index']}?folder={m['folder']}",
+                    "is_inline": a["is_inline"],
+                    "url": a["url"],
                 }
-                for a in atts
+                for a in listed
             ],
+            "inline_count": len(inline),
             "url": f"/api/messages/{m['uid']}?folder={m['folder']}",
             "web_url": f"/?folder={m['folder']}&uid={m['uid']}",
         }
         if include_html:
-            item["body_html"] = body["body_html"]
+            item["body_html"] = resolve_cids(body["body_html"], m["folder"], m["uid"], atts)
         out.append(item)
 
     return {
