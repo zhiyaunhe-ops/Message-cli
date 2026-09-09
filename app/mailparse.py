@@ -152,6 +152,21 @@ def parse_raw(raw: bytes) -> dict:
             h = _part_text(part)
             if h.strip():
                 html_parts.append(h)
+        elif ctype in ("text/calendar", "application/ics"):
+            # 日历邀请：作为附件存下来（分类时用来识别会议通知）
+            data = part.get_payload(decode=True) or b""
+            attachments.append(
+                {
+                    "index": idx,
+                    "filename": str(filename or "invite.ics"),
+                    "content_type": ctype,
+                    "size": len(data),
+                    "content_id": "",
+                    "is_inline": False,
+                    "_data": data,
+                }
+            )
+            idx += 1
         else:
             data = part.get_payload(decode=True) or b""
             if data and (ctype.startswith(("image/", "audio/", "video/", "application/"))):
@@ -177,6 +192,24 @@ def parse_raw(raw: bytes) -> dict:
     from_list = _parse_addr_list(msg, "From")
     sender = from_list[0] if from_list else {"name": "", "email": ""}
 
+    def _sig(key: str) -> str:
+        return _decode_header_value(msg, key).strip()
+
+    signals = {
+        "auto_submitted": _sig("Auto-Submitted").lower(),
+        "precedence": _sig("Precedence").lower(),
+        "list_unsubscribe": _sig("List-Unsubscribe"),
+        "x_autoreply": _sig("X-Autoreply").lower(),
+        "x_autorespond": _sig("X-Autorespond").lower(),
+        "x_mailer": _sig("X-Mailer").lower(),
+        "return_path": _sig("Return-Path").lower(),
+        "has_calendar": any(
+            (a["content_type"] or "").lower().startswith("text/calendar")
+            or str(a["filename"]).lower().endswith(".ics")
+            for a in attachments
+        ),
+    }
+
     return {
         "message_id": _decode_header_value(msg, "Message-ID").strip(),
         "subject": _decode_header_value(msg, "Subject").strip() or "(无主题)",
@@ -193,5 +226,6 @@ def parse_raw(raw: bytes) -> dict:
         "body_html": body_html,
         "snippet": make_snippet(body_text or html_to_text(body_html)),
         "attachments": attachments,
+        "signals": signals,
         "_raw": raw,
     }

@@ -89,6 +89,22 @@ class Store:
                 self.conn.execute("ALTER TABLE attachments ADD COLUMN content_id TEXT DEFAULT ''")
                 self.conn.commit()
 
+        mcols = {r["name"] for r in self.conn.execute("PRAGMA table_info(messages)")}
+        added = False
+        with self._lock:
+            if "category" not in mcols:
+                self.conn.execute("ALTER TABLE messages ADD COLUMN category TEXT DEFAULT ''")
+                added = True
+            if "is_boring" not in mcols:
+                self.conn.execute("ALTER TABLE messages ADD COLUMN is_boring INTEGER DEFAULT 0")
+                added = True
+            if "thread_id" not in mcols:
+                self.conn.execute("ALTER TABLE messages ADD COLUMN thread_id TEXT DEFAULT ''")
+                added = True
+                self.conn.execute("CREATE INDEX IF NOT EXISTS idx_msg_thread ON messages(thread_id)")
+            if added:
+                self.conn.commit()
+
     def _exec(self, sql: str, params=()):
         with self._lock:
             cur = self.conn.execute(sql, params)
@@ -197,19 +213,18 @@ class Store:
         ).fetchall()
         return [int(r["uid"]) for r in rows]
 
-    # ---------- 读取 ----------
-    def list_messages(
+    # ---------- 查询条件 ----------
+    def _msg_where(
         self,
-        folders: list[str] | None = None,
-        since: str | None = None,
-        until: str | None = None,
-        q: str | None = None,
-        unread_only: bool = False,
-        has_attachment: bool | None = None,
-        limit: int = 50,
-        offset: int = 0,
-        order: str = "desc",
-    ) -> tuple[int, list[dict]]:
+        folders=None,
+        since=None,
+        until=None,
+        q=None,
+        unread_only=False,
+        has_attachment=None,
+        boring=None,
+        category=None,
+    ) -> tuple[str, list]:
         where, params = [], []
         if folders:
             where.append("m.folder IN (%s)" % ",".join("?" * len(folders)))
@@ -226,6 +241,13 @@ class Store:
             where.append("m.has_attach = 1")
         elif has_attachment is False:
             where.append("m.has_attach = 0")
+        if category:
+            where.append("m.category = ?")
+            params.append(category)
+        if boring is True:
+            where.append("m.is_boring = 1")
+        elif boring is False:
+            where.append("m.is_boring = 0")
         if q:
             like = f"%{q}%"
             where.append(
@@ -233,7 +255,24 @@ class Store:
                 "OR m.snippet LIKE ? OR COALESCE(b.body_text,'') LIKE ?)"
             )
             params.extend([like] * 6)
-        wsql = ("WHERE " + " AND ".join(where)) if where else ""
+        return ("WHERE " + " AND ".join(where)) if where else "", params
+
+    # ---------- 读取 ----------
+    def list_messages(
+        self,
+        folders: list[str] | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        q: str | None = None,
+        unread_only: bool = False,
+        has_attachment: bool | None = None,
+        category: str | None = None,
+        boring: bool | None = None,
+        limit: int = 50,
+        offset: int = 0,
+        order: str = "desc",
+    ) -> tuple[int, list[dict]]:
+        wsql, params = self._msg_where(folders, since, until, q, unread_only, has_attachment, boring, category)
         ordsql = "DESC" if order.lower() != "asc" else "ASC"
 
         total = self.conn.execute(
@@ -299,6 +338,153 @@ class Store:
         row = self.conn.execute(sql, params).fetchone()
         return {"count": row["n"] or 0, "oldest": row["oldest"], "newest": row["newest"]}
 
+    # ---------- 分类 ----------
+    def classify_all(self, force: bool = False) -> dict:
+        """给邮件打上 category / is_boring（默认只处理还没分类的）。"""
+        from . import classify as classify_mod
+
+        sql = "SELECT folder,uid,subject,from_name,from_addr,snippet FROM messages"
+        if not force:
+            sql += " WHERE category='' OR category IS NULL"
+        rows = self.conn.execute(sql).fetchall()
+        counts: dict[str, int] = {}
+        for r in rows:
+            brow = self.conn.execute(
+                "SELECT headers_json FROM bodies WHERE folder=? AND uid=?", (r["folder"], r["uid"])
+            ).fetchone()
+            headers = json.loads(brow["headers_json"] or "{}") if brow else {}
+            rec = {
+                "subject": r["subject"],
+                "from_name": r["from_name"],
+                "from_addr": r["from_addr"],
+                "snippet": r["snippet"],
+                "headers": headers,
+                "attachments": self.get_attachments(r["folder"], r["uid"]),
+            }
+            cat, boring, _score, _reasons = classify_mod.classify(rec)
+            counts[cat] = counts.get(cat, 0) + 1
+            self._exec(
+                "UPDATE messages SET category=?, is_boring=? WHERE folder=? AND uid=?",
+                (cat, 1 if boring else 0, r["folder"], r["uid"]),
+            )
+        return {"scanned": len(rows), "counts": counts}
+
+    def category_stats(self) -> dict:
+        rows = self.conn.execute(
+            "SELECT COALESCE(NULLIF(category,''),'personal') AS c, COUNT(*) AS n FROM messages GROUP BY c"
+        ).fetchall()
+        by = {r["c"]: r["n"] for r in rows}
+        total = sum(by.values())
+        boring = sum(v for k, v in by.items() if k != "personal")
+        return {
+            "total": total,
+            "boring": boring,
+            "personal": by.get("personal", 0),
+            "boring_ratio": round(boring / total, 3) if total else 0.0,
+            "by_category": by,
+        }
+
+    def thread_stats(self) -> dict:
+        row = self.conn.execute(
+            "SELECT COUNT(DISTINCT thread_id) AS t, COUNT(*) AS m FROM messages WHERE thread_id<>''"
+        ).fetchone()
+        grouped = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM (SELECT thread_id FROM messages WHERE thread_id<>'' "
+            "GROUP BY thread_id HAVING COUNT(*)>1)"
+        ).fetchone()["c"]
+        return {"threads": row["t"] or 0, "messages": row["m"] or 0, "grouped": grouped or 0}
+
+    # ---------- 会话 ----------
+    def _thread_summary(self, tid: str, rows: list, own: set[str]) -> dict:
+        from . import threads as threads_mod
+
+        msgs = [self._row_to_msg(r) for r in rows]
+        msgs.sort(key=lambda m: (m["date_ts"] or 0, m["uid"]))
+        last = msgs[-1]
+        first = msgs[0]
+
+        seen: set[str] = set()
+        participants: list[dict] = []
+        for m in msgs:
+            people = [m["from"]] + (m["to"] or [])
+            for p in people:
+                e = (p.get("email") or "").strip().lower()
+                if not e or e in own or e in seen:
+                    continue
+                seen.add(e)
+                participants.append({"name": p.get("name") or e.split("@")[0], "email": e})
+
+        cats = [m["category"] for m in msgs if m["is_boring"]]
+        category = max(set(cats), key=cats.count) if cats else "personal"
+
+        return {
+            "thread_id": tid,
+            "subject": threads_mod.subject_title(last["subject"]),
+            "message_count": len(msgs),
+            "participants": participants[:6],
+            "participant_count": len(participants),
+            "unread": sum(1 for m in msgs if m["unread"]),
+            "first_date": first["date"],
+            "last_date": last["date"],
+            "last_ts": last["date_ts"],
+            "folders": sorted({m["folder"] for m in msgs}),
+            "has_attachment": any(m["has_attachment"] for m in msgs),
+            "attachment_count": sum(m["attachment_count"] or 0 for m in msgs),
+            "category": category,
+            "is_boring": bool(cats),
+            "snippet": last["snippet"],
+            "last_from": last["from"],
+            "last_uid": last["uid"],
+            "last_folder": last["folder"],
+            "messages": msgs,
+        }
+
+    def list_threads(
+        self,
+        folders: list[str] | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        q: str | None = None,
+        unread_only: bool = False,
+        boring: bool | None = None,
+        category: str | None = None,
+        own_emails: set[str] | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[int, list[dict]]:
+        own = {a.strip().lower() for a in (own_emails or set()) if a}
+        wsql, params = self._msg_where(folders, since, until, q, unread_only, None, boring, category)
+        wsql = (wsql + " AND" if wsql else "WHERE") + " m.thread_id<>''"
+        tids = {
+            r[0]
+            for r in self.conn.execute(
+                "SELECT DISTINCT m.thread_id FROM messages m "
+                "LEFT JOIN bodies b ON b.folder=m.folder AND b.uid=m.uid " + wsql,
+                params,
+            )
+        }
+        if not tids:
+            return 0, []
+        rows = self.conn.execute(
+            "SELECT * FROM messages WHERE thread_id<>'' ORDER BY date_ts ASC, uid ASC"
+        ).fetchall()
+        groups: dict[str, list] = {}
+        for r in rows:
+            if r["thread_id"] in tids:
+                groups.setdefault(r["thread_id"], []).append(r)
+        summaries = [self._thread_summary(tid, msgs, own) for tid, msgs in groups.items()]
+        summaries.sort(key=lambda t: t["last_ts"] or 0, reverse=True)
+        return len(summaries), summaries[offset : offset + limit]
+
+    def get_thread(self, thread_id: str, own_emails: set[str] | None = None) -> dict | None:
+        own = {a.strip().lower() for a in (own_emails or set()) if a}
+        rows = self.conn.execute(
+            "SELECT * FROM messages WHERE thread_id=? ORDER BY date_ts ASC, uid ASC", (thread_id,)
+        ).fetchall()
+        if not rows:
+            return None
+        return self._thread_summary(thread_id, rows, own)
+
     # ---------- 工具 ----------
     @staticmethod
     def _ts(date_str: str) -> float:
@@ -338,4 +524,7 @@ class Store:
             "attachment_count": row["attach_count"],
             "snippet": row["snippet"],
             "has_body": bool(row["has_body"]),
+            "category": row["category"] or "",
+            "is_boring": bool(row["is_boring"]),
+            "thread_id": row["thread_id"] or "",
         }

@@ -10,26 +10,36 @@
 - `folder` 使用服务端原名（INBOX / Sent Items / Drafts …），可重复传入；传 `all` 表示全部目录。
 - `uid` 是 IMAP UID，仅在所属 folder 内唯一；全局 id 形如 `INBOX:1234`。
 - `since` / `until` 接受 `YYYY-MM-DD` 或 ISO datetime；分页用 `limit`（上限 500）+ `offset`。
+- `category` 邮件分类：`personal`=人工邮件；`meeting`=会议/日程；`automated`=系统自动；`promotion`=营销推广。
+  后三类合称「无聊邮件」（`is_boring=true`），可用 `?boring=true/false` 或 `?category=` 过滤。
+- `thread_id` 会话 ID：同一来回复用一封（含 In-Reply-To 串联 + 主题/参与者归并），形如 `t`+14 位十六进制。
+- `mine`：true 表示该邮件是本人发出的（发件人是自己，或位于已发送/草稿目录）。
 
 ## 推荐调用顺序
 
-1. `GET /api/status`                 确认服务与索引状态
-2. `POST /api/sync` `{"all_folders": true, "since": "2026-07-01"}`   把邮件拉到本地索引（幂等、增量）
+1. `GET /api/status`                 确认服务与索引状态（含分类统计、会话数）
+2. `POST /api/sync` `{"all_folders": true, "since": "2026-07-01"}`   把邮件拉到本地索引（幂等、增量，自动分类+归组）
 3. `GET /api/ai/inbox?since=2026-07-01&limit=100`                    读结构化邮件（默认含清洗后的正文，截断 4000 字符）
-4. `GET /api/messages/{uid}?folder=INBOX`                            取单封全文与附件清单
-5. `GET /api/ai/digest?since=2026-07-01&group_by=sender`             按发件人/日期聚合，用于概览
+4. `GET /api/ai/threads?since=2026-07-01&only_grouped=true`          按会话读（省 token，聊天式输出）
+5. `GET /api/messages/{uid}?folder=INBOX`                            取单封全文与附件清单
+6. `GET /api/ai/digest?since=2026-07-01&group_by=sender`             按发件人/日期聚合，用于概览
 
 ## 端点清单
 
-- GET  /api/status                       服务、账号、各目录计数与同步时间
+- GET  /api/status                       服务、账号、各目录计数、分类统计、会话统计
 - GET  /api/folders                      目录列表（含总数/未读数）
 - POST /api/sync                         增量同步；body: {folder|all_folders, since, limit, force, with_body}
-- GET  /api/messages                     信封列表；参数 folder/since/until/q/unread_only/has_attachment/limit/offset/order
+- POST /api/reindex                      重建派生索引（分类+会话归组）；body: {classify_all, rebuild}
+- GET  /api/categories                   分类统计：无聊邮件占比、各类数量、会话数
+- GET  /api/messages                     信封列表；参数 folder/since/until/q/unread_only/has_attachment/category/boring/limit/offset/order
 - GET  /api/messages/{uid}               单封全文；参数 folder/include_body/body_format=text|html|both
 - GET  /api/messages/{uid}/attachment/{index}   下载附件
 - POST /api/messages/{uid}/flags         改标志；body: {folder, add:["\\Seen"], remove:[]}
 - GET  /api/search?q=...                 全文搜索（主题/发件人/收件人/正文）
-- GET  /api/ai/inbox                     AI 主入口：结构化列表，参数 since/until/folder/q/unread_only/limit/offset/body_chars/include_html
+- GET  /api/threads                      会话列表；参数 folder/since/until/q/unread_only/boring/category/only_grouped/limit/offset/preview
+- GET  /api/threads/{thread_id}          单条会话全文（按时间顺序，含每封正文与附件）
+- GET  /api/ai/inbox                     AI 主入口：结构化列表，参数 since/until/folder/q/unread_only/boring/category/limit/offset/body_chars/include_html
+- GET  /api/ai/threads                   AI 会话入口：聊天式输出，参数同 /api/threads + body_chars/max_messages
 - GET  /api/ai/digest                    聚合统计；group_by=sender|date|subject|folder
 - GET  /api/ai/schema                    机器可读的接口自述（与本文等价）
 - GET  /api/ai/verify?since=2026-07-01   校验时间窗内各目录数量、日期范围、附件数
@@ -40,4 +50,13 @@
 
     curl "http://127.0.0.1:8765/api/ai/inbox?since=2026-07-01&folder=all&limit=200"
 
-Web 界面：http://127.0.0.1:8765/  （支持 5 套主题：宣纸水墨 / 瑞士极简 / 暗夜霓虹 / 复古终端 / 琉璃柔彩）
+只看人工邮件（滤掉会议通知/系统自动/营销推广）：
+
+    curl "http://127.0.0.1:8765/api/ai/inbox?since=2026-07-01&boring=false&limit=100"
+
+按会话读全部往返（只看多于一封的会话）：
+
+    curl "http://127.0.0.1:8765/api/ai/threads?since=2026-07-01&only_grouped=true&limit=30"
+
+Web 界面：http://127.0.0.1:8765/  （支持 5 套主题：宣纸水墨 / 瑞士极简 / 暗夜霓虹 / 复古终端 / 琉璃柔彩；
+列表头可切换「邮件 / 会话」两种视图，并按分类筛选）

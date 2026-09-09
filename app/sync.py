@@ -130,6 +130,7 @@ def sync_folder(
             result["new" if env.uid not in known else "updated"] += 1
 
     # 2) 正文/附件：限定时间窗内、且本地还没有正文的邮件
+    touched: list[int] = []
     if with_body:
         need = store.uids_without_body(folder, limit=body_limit or envelope_limit)
         if since:
@@ -183,18 +184,69 @@ def sync_folder(
                         "date": parsed["date_iso"] or "",
                         "message_id": parsed["message_id"],
                         "reply_to": parsed["reply_to"],
+                        "signals": parsed.get("signals", {}),
                     },
                 )
                 if parsed["attachments"]:
                     save_attachments(store, folder, uid, parsed["attachments"])
                     result["attachments"] += len(parsed["attachments"])
                 result["bodies"] += 1
+                touched.append(uid)
         else:
             tick("正文已是最新")
 
     store.upsert_folder(folder, st["uidvalidity"], st["uidnext"])
+
+    # 3) 抓完正文后再分类（Auto-Submitted / .ics 等信号此时才齐全）
+    if result["new"] or result["updated"] or touched:
+        tick("分类与会话归组")
+        result["categories"] = classify_folder(store, folder, touched or None)
+
+    # 4) 会话归组（整库重算，成本很低）
+    try:
+        from .threads import rebuild as rebuild_threads
+
+        own = {getattr(client.account, "email", "").lower()} if getattr(client, "account", None) else set()
+        own.discard("")
+        result["threads"] = rebuild_threads(store, own_emails=own)
+    except Exception as e:  # 归组失败不影响同步结果
+        result["errors"].append(f"threads: {e}")
+
     result["elapsed"] = round(time.time() - t0, 2)
     return result
+
+
+def classify_folder(store: Store, folder: str, uids: list[int] | None = None) -> dict:
+    """给（本目录新抓到正文的）邮件打分类标签。uids 为空时处理全目录。"""
+    from .classify import classify
+
+    sql = "SELECT folder,uid,subject,from_name,from_addr,snippet FROM messages WHERE folder=?"
+    params: list = [folder]
+    if uids:
+        sql += " AND uid IN (%s)" % ",".join("?" * len(uids))
+        params.extend(uids)
+    rows = store.conn.execute(sql, params).fetchall()
+    counts: dict[str, int] = {}
+    for r in rows:
+        brow = store.conn.execute(
+            "SELECT headers_json FROM bodies WHERE folder=? AND uid=?", (r["folder"], r["uid"])
+        ).fetchone()
+        headers = json.loads(brow["headers_json"] or "{}") if brow else {}
+        rec = {
+            "subject": r["subject"],
+            "from_name": r["from_name"],
+            "from_addr": r["from_addr"],
+            "snippet": r["snippet"],
+            "headers": headers,
+            "attachments": store.get_attachments(r["folder"], r["uid"]),
+        }
+        cat, boring, _score, _why = classify(rec)
+        counts[cat] = counts.get(cat, 0) + 1
+        store._exec(
+            "UPDATE messages SET category=?, is_boring=? WHERE folder=? AND uid=?",
+            (cat, 1 if boring else 0, r["folder"], r["uid"]),
+        )
+    return counts
 
 
 def sync_all(

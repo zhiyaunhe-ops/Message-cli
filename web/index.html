@@ -46,6 +46,18 @@
 
     <section class="list-pane">
       <div class="list-head">
+        <div class="seg view-seg" id="viewSeg">
+          <button data-view="message" class="active" title="普通邮件列表">邮件</button>
+          <button data-view="thread" title="按来回复分组，聊天式阅读">会话</button>
+        </div>
+        <select class="select cat-select" id="category" title="按分类筛选">
+          <option value="all">全部分类</option>
+          <option value="personal">只看人工</option>
+          <option value="boring">只看无聊</option>
+          <option value="meeting">📅 会议/日程</option>
+          <option value="automated">🤖 系统自动</option>
+          <option value="promotion">📢 营销推广</option>
+        </select>
         <span class="list-head-title" id="listTitle">收件箱</span>
         <span class="list-head-count" id="listCount"></span>
       </div>

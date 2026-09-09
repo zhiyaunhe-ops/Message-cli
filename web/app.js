@@ -23,6 +23,8 @@
     folders: [],
     bodyMode: "rich",       // rich | text | source
     showExternal: false,    // 是否显示外链图片（防追踪，默认屏蔽）
+    viewMode: "message",    // message | thread
+    category: "all",        // all | personal | boring | meeting | automated | promotion
   };
 
   const $ = (sel) => document.querySelector(sel);
@@ -80,6 +82,21 @@
 
   function esc(s) { return String(s == null ? "" : s); }
 
+  const CAT_META = {
+    meeting: { label: "会议", emoji: "📅", cls: "cat-meeting" },
+    automated: { label: "系统", emoji: "🤖", cls: "cat-automated" },
+    promotion: { label: "推广", emoji: "📢", cls: "cat-promotion" },
+  };
+  function catBadge(m) {
+    const meta = CAT_META[m.category];
+    if (!meta) return null;
+    return el("span", "cat-badge " + meta.cls, `${meta.emoji} ${meta.label}`);
+  }
+  function initials(name, email) {
+    const n = (name || email || "?").trim();
+    return (n[0] || "?").toUpperCase();
+  }
+
   let toastTimer = null;
   function toast(msg, ms) {
     const t = $("#toast");
@@ -126,6 +143,22 @@
       b.addEventListener("click", () => { applyTheme(t.id); menu.classList.remove("open"); });
       menu.appendChild(b);
     });
+
+    // CRT 扫描线开关（默认关：扫描线会盖在图片上，像蒙了一层条纹阴影）
+    let crtOn = false;
+    try { crtOn = localStorage.getItem("mail.crt") === "on"; } catch (e) {}
+    document.documentElement.classList.toggle("crt-on", crtOn);
+    const wrap = el("label", "theme-crt");
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = crtOn;
+    cb.addEventListener("change", () => {
+      document.documentElement.classList.toggle("crt-on", cb.checked);
+      try { localStorage.setItem("mail.crt", cb.checked ? "on" : "off"); } catch (e) {}
+    });
+    wrap.appendChild(cb);
+    wrap.appendChild(el("span", null, "CRT 扫描线（复古终端）"));
+    menu.appendChild(wrap);
   }
 
   /* ------------------------------ 目录 ------------------------------ */
@@ -160,10 +193,15 @@
     state.folder = name;
     state.offset = 0;
     state.current = null;
-    $("#listTitle").textContent = folderLabel(name);
+    $("#listTitle").textContent = folderLabel(name) + (state.viewMode === "thread" ? " · 会话" : "");
     renderFolders();
-    $("#reader").innerHTML = '<div class="empty">选择一封邮件开始阅读</div>';
-    loadMessages(false);
+    $("#reader").innerHTML =
+      state.viewMode === "thread" ? '<div class="empty">选择一条会话开始阅读</div>' : '<div class="empty">选择一封邮件开始阅读</div>';
+    loadCurrent(false);
+  }
+
+  function loadCurrent(append) {
+    return state.viewMode === "thread" ? loadThreads(append) : loadMessages(append);
   }
 
   /* ------------------------------ 列表 ------------------------------ */
@@ -180,6 +218,9 @@
     });
     if (state.q) params.set("q", state.q);
     if (state.unreadOnly) params.set("unread_only", "true");
+    if (state.category === "boring") params.set("boring", "true");
+    else if (state.category === "personal") params.set("boring", "false");
+    else if (state.category !== "all") params.set("category", state.category);
     if (state.since === "all") params.delete("since");
 
     let data;
@@ -205,12 +246,15 @@
       if (g !== lastGroup) { list.appendChild(el("div", "date-sep", g)); lastGroup = g; }
 
       const row = el("div", "msg-row" + (m.unread ? " is-unread" : "") +
+        (m.is_boring ? " is-boring" : "") +
         (state.current && state.current.uid === m.uid && state.current.folder === m.folder ? " is-selected" : ""));
       row.dataset.uid = m.uid;
       row.dataset.folder = m.folder;
 
       const line = el("div", "msg-line");
       line.appendChild(el("span", "msg-from", m.from.name || m.from.email));
+      const badge = catBadge(m);
+      if (badge) line.appendChild(badge);
       line.appendChild(el("span", "msg-time", fmtTime(m.date)));
       row.appendChild(line);
       row.appendChild(el("div", "msg-subject", m.subject || "(无主题)"));
@@ -378,7 +422,15 @@
         } else {
           const ph = el("span", "ext-img");
           ph.dataset.src = src;
-          ph.title = src;
+          ph.title = "点击加载这张外部图片";
+          ph.addEventListener("click", () => {
+            const img = new Image();
+            img.src = src;
+            img.referrerPolicy = "no-referrer";
+            img.className = "inline-img";
+            img.loading = "lazy";
+            ph.replaceWith(img);
+          });
           img.replaceWith(ph);
         }
       } else if (/^cid:/i.test(src)) {
@@ -511,6 +563,250 @@
     } catch (e) { toast("操作失败：" + e.message); }
   }
 
+  /* ------------------------------ 会话视图 ------------------------------ */
+  function currentParams(extra) {
+    const params = new URLSearchParams({
+      since: state.since === "all" ? "" : state.since,
+      limit: String(state.limit),
+      offset: String(state.offset),
+    });
+    if (state.q) params.set("q", state.q);
+    if (state.unreadOnly) params.set("unread_only", "true");
+    if (state.category === "boring") params.set("boring", "true");
+    else if (state.category === "personal") params.set("boring", "false");
+    else if (state.category !== "all") params.set("category", state.category);
+    if (state.since === "all") params.delete("since");
+    if (extra) extra(params);
+    return params;
+  }
+
+  async function loadThreads(append) {
+    const list = $("#messageList");
+    if (!append) { list.innerHTML = '<div class="empty">加载中…</div>'; state.offset = 0; }
+    const params = currentParams((p) => p.set("folder", state.folder));
+    let data;
+    try {
+      data = await api("/api/threads?" + params.toString());
+    } catch (e) {
+      list.innerHTML = `<div class="empty">加载失败：${e.message}</div>`;
+      return;
+    }
+    state.total = data.total;
+    state.items = append ? state.items.concat(data.items) : data.items;
+
+    list.innerHTML = "";
+    if (!state.items.length) {
+      list.innerHTML = '<div class="empty">没有匹配的会话</div>';
+      $("#listCount").textContent = "0 条";
+      $("#moreBtn").style.display = "none";
+      return;
+    }
+    state.items.forEach((t) => {
+      const row = el("div", "thread-row" + (t.unread ? " is-unread" : "") + (t.is_boring ? " is-boring" : ""));
+      row.dataset.thread = t.thread_id;
+
+      const av = el("div", "avatar", t.is_boring ? CAT_META[t.category].emoji : initials(t.last_from.name, t.last_from.email));
+      row.appendChild(av);
+
+      const main = el("div", "thread-main");
+      const line1 = el("div", "thread-line1");
+      line1.appendChild(el("span", "thread-title", t.subject));
+      line1.appendChild(el("span", "thread-time", fmtTime(t.last_date)));
+      main.appendChild(line1);
+
+      const line2 = el("div", "thread-line2");
+      const names = (t.participants || []).map((p) => p.name).slice(0, 3).join("、");
+      line2.appendChild(el("span", "thread-people", names + (t.participant_count > 3 ? ` 等 ${t.participant_count} 人` : "")));
+      if (t.message_count > 1) line2.appendChild(el("span", "thread-count", t.message_count));
+      const badge = catBadge(t);
+      if (badge) line2.appendChild(badge);
+      main.appendChild(line2);
+
+      main.appendChild(el("div", "thread-snippet", t.snippet || ""));
+      row.appendChild(main);
+      if (t.unread) row.appendChild(el("span", "badge-unread"));
+
+      row.addEventListener("click", () => openThread(t.thread_id, row));
+      list.appendChild(row);
+    });
+
+    $("#listCount").textContent = `${state.total} 条会话`;
+    $("#moreBtn").style.display = state.items.length < state.total ? "" : "none";
+    $("#moreBtn").textContent = `加载更多（还有 ${state.total - state.items.length} 条）`;
+  }
+
+  async function openThread(threadId, row) {
+    document.querySelectorAll(".thread-row").forEach((n) => n.classList.remove("is-selected"));
+    if (row) row.classList.add("is-selected");
+
+    const reader = $("#reader");
+    reader.innerHTML = '<div class="empty">加载中…</div>';
+    try {
+      const t = await api(`/api/threads/${threadId}?body_chars=60000&body_format=both`);
+      renderChat(t);
+      // 把未读的都顺手标已读（和点开单封一致）
+      const unreadMsgs = (t.messages || []).filter((m) => m.unread && m.folder !== "Drafts");
+      if (unreadMsgs.length) {
+        Promise.all(
+          unreadMsgs.map((m) =>
+            fetch(`/api/messages/${m.uid}/flags`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ folder: m.folder, add: ["\\Seen"] }),
+            }).catch(() => {})
+          )
+        ).then(() => {
+          if (row) { row.classList.remove("is-unread"); }
+          loadFolders();
+        });
+      }
+    } catch (e) {
+      reader.innerHTML = `<div class="empty">读取失败：${e.message}</div>`;
+    }
+  }
+
+  /** 把长引用折叠起来（聊天感觉的关键） */
+  function foldQuotes(root) {
+    root.querySelectorAll("blockquote").forEach((q) => {
+      if ((q.textContent || "").trim().length < 120) return;
+      const det = document.createElement("details");
+      det.className = "quote-fold";
+      const sum = el("summary", null, "⋯ 显示引用的历史内容");
+      det.appendChild(sum);
+      q.replaceWith(det);
+      det.appendChild(q);
+    });
+    // 常见的「-----原始邮件-----」分隔块（div 形式）
+    root.querySelectorAll("div").forEach((d) => {
+      if (d.closest(".quote-fold")) return;
+      const head = (d.textContent || "").trim().slice(0, 60);
+      if (!/^(?:[-=_]{3,}\s*)?(?:原始邮件|Original Message|发件人[:：]|From\s*:)/i.test(head)) return;
+      if ((d.textContent || "").trim().length < 120) return;
+      const det = document.createElement("details");
+      det.className = "quote-fold";
+      det.appendChild(el("summary", null, "⋯ 显示引用的历史内容"));
+      d.replaceWith(det);
+      det.appendChild(d);
+    });
+  }
+
+  function renderChat(t) {
+    const reader = $("#reader");
+    reader.innerHTML = "";
+
+    const bar = el("div", "reader-bar");
+    bar.appendChild(el("span", "chat-stat", `${t.message_count} 封 · ${t.participant_count} 人 · ${t.unread ? t.unread + " 未读" : "全部已读"}`));
+    bar.appendChild(el("div", "spacer"));
+    if (t.is_boring) {
+      const meta = CAT_META[t.category] || { emoji: "❓", label: t.category_label };
+      bar.appendChild(el("span", "cat-badge " + (CAT_META[t.category] ? CAT_META[t.category].cls : ""), `${meta.emoji} ${meta.label} · 无聊邮件`));
+    }
+    const backBtn = el("button", "btn", "在邮件视图打开最新一封");
+    backBtn.onclick = () => {
+      state.viewMode = "message";
+      document.querySelectorAll("#viewSeg button").forEach((b) => b.classList.toggle("active", b.dataset.view === "message"));
+      loadMessages(false).then(() => {
+        const last = t.messages[t.messages.length - 1];
+        const row = document.querySelector(`.msg-row[data-uid="${last.uid}"]`);
+        openMessage(last.folder, last.uid, row);
+      });
+    };
+    bar.appendChild(backBtn);
+    reader.appendChild(bar);
+
+    const inner = el("div", "reader-inner chat-wrap");
+    inner.appendChild(el("h2", "reader-subject", t.subject || "(无主题)"));
+
+    const meta = el("div", "reader-meta chat-meta");
+    const r = el("div", "meta-row");
+    r.appendChild(el("span", "meta-label", "参与人"));
+    r.appendChild(el("span", "meta-value", (t.participants || []).map((p) => p.name || p.email).join("、") || "-"));
+    meta.appendChild(r);
+    inner.appendChild(meta);
+
+    const chat = el("div", "chat");
+    let lastDay = "";
+    let prev = null;
+
+    t.messages.forEach((m) => {
+      const d = parseDate(m.date);
+      const day = d ? d.toDateString() : "";
+      if (day && day !== lastDay) {
+        chat.appendChild(el("div", "chat-day", groupLabel(m.date)));
+        lastDay = day;
+        prev = null;
+      }
+
+      const mine = !!m.mine;
+      const sender = m.from || {};
+      const nearPrev =
+        prev && prev.mine === mine &&
+        (prev.from || {}).email === sender.email &&
+        d && prev._d && d - prev._d < 10 * 60000;
+
+      const rowEl = el("div", "bubble-row" + (mine ? " mine" : ""));
+      const av = el("div", "avatar", initials(sender.name, sender.email));
+      if (av) rowEl.appendChild(av);
+
+      const bubble = el("div", "bubble" + (mine ? " mine" : "") + (nearPrev ? " grouped" : ""));
+      if (!nearPrev) {
+        const head = el("div", "bubble-head");
+        head.appendChild(el("span", "bubble-name", sender.name || sender.email || "?"));
+        head.appendChild(el("span", "bubble-time", fmtFull(m.date)));
+        const badge = catBadge(m);
+        if (badge) head.appendChild(badge);
+        bubble.appendChild(head);
+      }
+
+      const body = el("div", "bubble-body");
+      if (m.body_html && m.body_html.trim()) {
+        body.innerHTML = sanitizeHtml(m.body_html);
+      } else {
+        body.innerHTML = textToHtml(m.body_text, m);
+      }
+      foldQuotes(body);
+      const blocked = applyImagePolicy(body);
+      bubble.appendChild(body);
+
+      if (m.attachments && m.attachments.length) {
+        const box = el("div", "attach-list bubble-attach");
+        m.attachments.forEach((a) => {
+          const chip = el("a", "attach-chip");
+          chip.href = a.url;
+          chip.target = "_blank";
+          chip.rel = "noopener";
+          chip.appendChild(el("span", null, `📎 ${a.filename}`));
+          chip.appendChild(el("span", "attach-size", fmtBytes(a.size)));
+          box.appendChild(chip);
+        });
+        bubble.appendChild(box);
+      }
+
+      const foot = el("div", "bubble-foot");
+      foot.appendChild(el("span", "bubble-folder", folderLabel(m.folder)));
+      foot.appendChild(el("span", "bubble-size", `UID ${m.uid}`));
+      const openBtn = el("button", "bubble-open", "查看原文 ⤢");
+      openBtn.onclick = () => {
+        state.viewMode = "message";
+        document.querySelectorAll("#viewSeg button").forEach((b) => b.classList.toggle("active", b.dataset.view === "message"));
+        loadMessages(false).then(() => {
+          const row = document.querySelector(`.msg-row[data-uid="${m.uid}"]`);
+          openMessage(m.folder, m.uid, row);
+        });
+      };
+      foot.appendChild(openBtn);
+      bubble.appendChild(foot);
+
+      rowEl.appendChild(bubble);
+      chat.appendChild(rowEl);
+      prev = { mine, from: sender, _d: d };
+    });
+
+    inner.appendChild(chat);
+    reader.appendChild(inner);
+    inner.scrollTop = inner.scrollHeight;
+  }
+
   /* ------------------------------ 同步 ------------------------------ */
   async function doSync() {
     const btn = $("#syncBtn");
@@ -540,10 +836,13 @@
       const s = await api("/api/status");
       $("#account").textContent = s.account.email;
       const st = s.stats || {};
+      const c = s.categories || {};
+      const th = s.threads || {};
       $("#stats").innerHTML =
         `本地索引 <b>${st.total || 0}</b> 封<br>` +
+        `无聊邮件 <b>${c.boring || 0}</b> 封（${Math.round((c.boring_ratio || 0) * 100)}%）<br>` +
+        `会话 <b>${th.threads || 0}</b> 条（${th.grouped || 0} 条多人往返）<br>` +
         (st.oldest ? `最早 <b>${st.oldest.slice(0, 10)}</b><br>` : "") +
-        (st.newest ? `最新 <b>${st.newest.slice(0, 10)}</b><br>` : "") +
         `快捷键 <b>J/K</b> 切换 · <b>/</b> 搜索`;
     } catch (e) {
       $("#account").textContent = "未连接";
@@ -556,7 +855,7 @@
     $("#search").addEventListener("input", (e) => {
       clearTimeout(timer);
       const v = e.target.value.trim();
-      timer = setTimeout(() => { state.q = v; state.offset = 0; loadMessages(false); }, 300);
+      timer = setTimeout(() => { state.q = v; state.offset = 0; loadCurrent(false); }, 300);
     });
 
     $("#range").addEventListener("change", (e) => {
@@ -567,17 +866,38 @@
         state.since = d.toISOString().slice(0, 10);
       } else state.since = v;
       state.offset = 0;
-      loadMessages(false);
+      loadCurrent(false);
     });
 
-    $("#moreBtn").addEventListener("click", () => { state.offset += state.limit; loadMessages(true); });
+    $("#moreBtn").addEventListener("click", () => { state.offset += state.limit; loadCurrent(true); });
     $("#syncBtn").addEventListener("click", doSync);
+
+    document.querySelectorAll("#viewSeg button").forEach((b) => {
+      b.addEventListener("click", () => {
+        if (state.viewMode === b.dataset.view) return;
+        state.viewMode = b.dataset.view;
+        document.querySelectorAll("#viewSeg button").forEach((x) => x.classList.toggle("active", x === b));
+        state.current = null;
+        state.offset = 0;
+        $("#listTitle").textContent = folderLabel(state.folder) + (state.viewMode === "thread" ? " · 会话" : "");
+        $("#reader").innerHTML = state.viewMode === "thread"
+          ? '<div class="empty">选择一条会话开始阅读</div>'
+          : '<div class="empty">选择一封邮件开始阅读</div>';
+        loadCurrent(false);
+      });
+    });
+
+    $("#category").addEventListener("change", (e) => {
+      state.category = e.target.value;
+      state.offset = 0;
+      loadCurrent(false);
+    });
 
     $("#unreadBtn").addEventListener("click", (e) => {
       state.unreadOnly = !state.unreadOnly;
       e.target.classList.toggle("btn-primary", state.unreadOnly);
       state.offset = 0;
-      loadMessages(false);
+      loadCurrent(false);
     });
 
     const menu = $("#themeMenu");
@@ -617,15 +937,28 @@
     loadStatus();
 
     // 支持 /?folder=INBOX&uid=123 直达某封邮件（API 里的 web_url 就指向这里）
+    // 也支持 /?thread=txxx 直达某条会话
     const params = new URLSearchParams(location.search);
     const folderParam = params.get("folder");
     const uidParam = params.get("uid");
+    const threadParam = params.get("thread");
     if (folderParam) state.folder = folderParam;
 
+    if (threadParam) {
+      // 会话直链：切到会话视图
+      state.viewMode = "thread";
+      document.querySelectorAll("#viewSeg button").forEach((b) =>
+        b.classList.toggle("active", b.dataset.view === "thread")
+      );
+    }
+
     loadFolders()
-      .then(() => loadMessages(false))
+      .then(() => loadCurrent(false))
       .then(() => {
-        if (uidParam) {
+        if (threadParam) {
+          const row = document.querySelector(`.thread-row[data-thread="${threadParam}"]`);
+          openThread(threadParam, row);
+        } else if (uidParam) {
           const uid = parseInt(uidParam, 10);
           if (!isNaN(uid)) {
             const row = document.querySelector(`.msg-row[data-uid="${uid}"]`);

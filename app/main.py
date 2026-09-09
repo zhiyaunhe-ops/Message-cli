@@ -18,9 +18,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import sync as syncmod
+from .classify import CATEGORY_EMOJI, CATEGORY_LABELS, classify, label as cat_label
 from .imap_client import IMAPClient
 from .settings import Account, ROOT, load_account
 from .store import Store
+from .threads import rebuild as rebuild_threads
 
 WEB_DIR = ROOT / "web"
 DEFAULT_SINCE = "2026-07-01"
@@ -58,6 +60,52 @@ def client() -> IMAPClient:
     return IMAPClient(account())
 
 
+def own_emails() -> set[str]:
+    """自己的地址（用于判断一封邮件是「我发的」还是「别人发的」）。"""
+    return {account().email.strip().lower()}
+
+
+def is_mine(msg: dict) -> bool:
+    addr = ((msg.get("from") or {}).get("email") or "").strip().lower()
+    return bool(addr and addr in own_emails()) or msg.get("folder") in ("Sent Items", "Drafts", "Sent", "已发送")
+
+
+def _enrich_categories(msg: dict) -> dict:
+    cat = msg.get("category") or "personal"
+    msg["category"] = cat
+    msg["category_label"] = cat_label(cat)
+    msg["category_emoji"] = CATEGORY_EMOJI.get(cat, "✉️")
+    msg["is_boring"] = bool(msg.get("is_boring"))
+    msg["mine"] = is_mine(msg)
+    return msg
+
+
+def reindex(classify_all: bool = False, rebuild: bool = True) -> dict:
+    """重建本地派生数据：分类 + 会话归组。"""
+    s = store()
+    out: dict = {}
+    if classify_all:
+        out["classified"] = s.classify_all(force=True)
+    else:
+        pending = s.conn.execute(
+            "SELECT COUNT(*) AS c FROM messages WHERE category='' OR category IS NULL"
+        ).fetchone()["c"]
+        out["classified"] = s.classify_all() if pending else {"scanned": 0}
+    if rebuild:
+        out["threads"] = rebuild_threads(s, own_emails=own_emails())
+    out["categories"] = s.category_stats()
+    return out
+
+
+@app.on_event("startup")
+def _startup():
+    """首次启动（或新增列后）自动补全分类与会话归组。"""
+    try:
+        reindex(classify_all=False, rebuild=True)
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------- 页面 / 静态
 app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
 
@@ -83,10 +131,23 @@ def ai_schema():
             "folder": "服务端原名，如 INBOX / Sent Items / Drafts；folder 参数可重复传入",
             "uid": "IMAP UID，仅在所属 folder 内唯一；全局 id 形如 'INBOX:1234'",
             "pagination": "limit + offset，响应含 total",
+            "category": "personal=人工邮件；meeting=会议/日程；automated=系统自动；promotion=营销推广。"
+                        "后三类合称「无聊邮件」(is_boring=true)，可用 ?boring=true/false 或 ?category= 过滤",
+            "thread_id": "会话 ID，同一来回复用一封；thread_id 形如 't'+14 位十六进制",
+            "mine": "true 表示这封是本人发出的（发件人是自己，或在已发送/草稿目录里）",
         },
         "endpoints": [
             {"method": "GET", "path": f"{base}/ai/inbox", "desc": "AI 首选：一次拿到结构化邮件列表（含清洗后的正文）",
              "params": ["since", "until", "folder", "q", "unread_only", "has_attachment", "limit", "offset", "body_chars", "include_html"]},
+            {"method": "GET", "path": f"{base}/ai/threads", "desc": "会话视图：同一来回复用一封，按时间顺序给出聊天式内容",
+             "params": ["since", "until", "folder", "q", "unread_only", "boring", "category", "only_grouped", "limit", "offset", "body_chars", "max_messages"]},
+            {"method": "GET", "path": f"{base}/threads", "desc": "会话列表（不含正文，轻量）",
+             "params": ["folder", "since", "until", "q", "unread_only", "boring", "category", "only_grouped", "limit", "offset", "preview"]},
+            {"method": "GET", "path": f"{base}/threads/{{thread_id}}", "desc": "单条会话全文，聊天视图直接消费",
+             "params": ["body_chars", "body_format"]},
+            {"method": "GET", "path": f"{base}/categories", "desc": "分类统计：无聊邮件占比、各类数量、会话数"},
+            {"method": "POST", "path": f"{base}/reindex", "desc": "重建派生索引（分类 + 会话归组）",
+             "body": {"classify_all": False, "rebuild": True}},
             {"method": "GET", "path": f"{base}/ai/digest", "desc": "聚合视图：按发件人/日期/主题分组统计，适合快速概览",
              "params": ["since", "until", "folder", "q", "group_by", "top"]},
             {"method": "GET", "path": f"{base}/messages", "desc": "信封级列表（不含正文，轻量）",
@@ -103,6 +164,8 @@ def ai_schema():
         ],
         "tips": [
             "想读 7 月以来的全部邮件：GET /api/ai/inbox?since=2026-07-01&limit=200",
+            "只想看人写的邮件（滤掉会议通知/系统自动/营销）：GET /api/ai/inbox?since=2026-07-01&boring=false",
+            "想按会话读（推荐，省 token）：GET /api/ai/threads?since=2026-07-01&only_grouped=true",
             "正文默认截断到 body_chars（默认 4000）字符，需要全文再调 /api/messages/{uid}",
             "搜索 q 会同时匹配主题、发件人、收件人和正文",
         ],
@@ -180,6 +243,8 @@ def status():
         "account": {"name": acc.name, "email": acc.email, "display_name": acc.display_name},
         "imap": {"host": acc.imap_host, "port": acc.imap_port, "ssl": acc.imap_ssl},
         "stats": s.stats(),
+        "categories": s.category_stats(),
+        "threads": s.thread_stats(),
         "folders": folders,
         "syncing": _state["syncing"],
         "last_sync": _state["last_sync"],
@@ -280,6 +345,8 @@ def list_messages(
     q: str | None = None,
     unread_only: bool = False,
     has_attachment: bool | None = None,
+    category: str | None = Query(default=None, pattern="^(personal|meeting|automated|promotion)$"),
+    boring: bool | None = Query(default=None, description="true=只看无聊邮件，false=只看人工邮件"),
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     order: str = "desc",
@@ -293,11 +360,19 @@ def list_messages(
         q=q,
         unread_only=unread_only,
         has_attachment=has_attachment,
+        category=category,
+        boring=boring,
         limit=limit,
         offset=offset,
         order=order,
     )
-    return {"total": total, "limit": limit, "offset": offset, "count": len(items), "items": items}
+    return {
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "count": len(items),
+        "items": [_enrich_categories(m) for m in items],
+    }
 
 
 @app.get("/api/messages/{uid}", summary="单封邮件全文")
@@ -326,6 +401,7 @@ def get_message(
     out["inline_images"] = inline      # 内嵌资源（已渲染进正文，不单独列出）
     out["attachment_count"] = len(real)
     out["inline_count"] = len(inline)
+    _enrich_categories(out)
     return out
 
 
@@ -377,6 +453,132 @@ def search(
 
 
 # ---------------------------------------------------------------- AI 专用
+# ---------------------------------------------------------------- 会话（聊天视图）
+@app.get("/api/threads", summary="会话列表（同一来回复用一封，类似 IM 会话）")
+def list_threads(
+    folder: list[str] | None = Query(default=None, description="可重复；不传=全部目录"),
+    since: str | None = Query(default=None, examples=["2026-07-01"]),
+    until: str | None = None,
+    q: str | None = None,
+    unread_only: bool = False,
+    category: str | None = Query(default=None, pattern="^(personal|meeting|automated|promotion)$"),
+    boring: bool | None = Query(default=None, description="true=只看无聊邮件，false=只看人工邮件"),
+    only_grouped: bool = Query(default=False, description="true=只看多于一封的会话"),
+    limit: int = Query(default=50, ge=1, le=300),
+    offset: int = Query(default=0, ge=0),
+    preview: int = Query(default=3, ge=0, le=20, description="每条会话预览几封邮件"),
+):
+    s = store()
+    # 先全量取回再过滤分页，保证 only_grouped 下的 total 准确
+    _total, threads = s.list_threads(
+        folders=list(folder) if folder else None,
+        since=since,
+        until=until,
+        q=q,
+        unread_only=unread_only,
+        boring=boring,
+        category=category,
+        own_emails=own_emails(),
+        limit=1000000,
+        offset=0,
+    )
+    items = []
+    for t in threads:
+        if only_grouped and t["message_count"] < 2:
+            continue
+        msgs = t["messages"]
+        items.append(
+            {
+                "thread_id": t["thread_id"],
+                "subject": t["subject"],
+                "message_count": t["message_count"],
+                "participants": t["participants"],
+                "participant_count": t["participant_count"],
+                "unread": t["unread"],
+                "first_date": t["first_date"],
+                "last_date": t["last_date"],
+                "folders": t["folders"],
+                "has_attachment": t["has_attachment"],
+                "attachment_count": t["attachment_count"],
+                "snippet": t["snippet"],
+                "last_from": t["last_from"],
+                "category": t["category"],
+                "category_label": cat_label(t["category"]),
+                "category_emoji": CATEGORY_EMOJI.get(t["category"], "✉️"),
+                "is_boring": t["is_boring"],
+                "preview": [
+                    {
+                        "id": m["id"],
+                        "folder": m["folder"],
+                        "uid": m["uid"],
+                        "date": m["date"],
+                        "from": m["from"],
+                        "mine": is_mine(m),
+                        "snippet": m["snippet"],
+                    }
+                    for m in msgs[-preview:]
+                ],
+                "url": f"/api/threads/{t['thread_id']}",
+                "web_url": f"/?thread={t['thread_id']}",
+            }
+        )
+    items = items[offset : offset + limit]
+    return {"total": _total if not only_grouped else len(items), "limit": limit, "offset": offset,
+            "count": len(items), "items": items}
+
+
+@app.get("/api/threads/{thread_id}", summary="单条会话全文（聊天视图数据）")
+def get_thread(
+    thread_id: str,
+    body_chars: int = Query(default=20000, ge=0, le=200000),
+    body_format: str = Query(default="both", pattern="^(text|html|both)$"),
+):
+    s = store()
+    t = s.get_thread(thread_id, own_emails=own_emails())
+    if not t:
+        raise HTTPException(404, f"未找到会话 {thread_id}（可能索引已重建）")
+    msgs = t.pop("messages")
+    out_msgs = []
+    for m in msgs:
+        body = s.get_body(m["folder"], m["uid"])
+        atts = s.get_attachments(m["folder"], m["uid"])
+        real, inline = split_attachments(atts, m["folder"], m["uid"])
+        item = dict(m)
+        if body_format in ("text", "both"):
+            item["body_text"] = _truncate(body["body_text"], body_chars)
+        if body_format in ("html", "both"):
+            item["body_html"] = resolve_cids(body["body_html"], m["folder"], m["uid"], atts)
+        item["attachments"] = real
+        item["inline_images"] = inline
+        item["attachment_count"] = len(real)
+        item["inline_count"] = len(inline)
+        item["web_url"] = f"/?folder={m['folder']}&uid={m['uid']}"
+        item["url"] = f"/api/messages/{m['uid']}?folder={m['folder']}"
+        out_msgs.append(_enrich_categories(item))
+    t["messages"] = out_msgs
+    t["category_label"] = cat_label(t["category"])
+    t["category_emoji"] = CATEGORY_EMOJI.get(t["category"], "✉️")
+    t["participants"] = t["participants"][:8]
+    return t
+
+
+@app.post("/api/reindex", summary="重建本地派生索引（分类 + 会话归组）")
+def do_reindex(classify_all: bool = False, rebuild: bool = True):
+    try:
+        return {"ok": True, **reindex(classify_all=classify_all, rebuild=rebuild)}
+    except Exception as e:
+        raise HTTPException(500, f"重建索引失败: {e}")
+
+
+@app.get("/api/categories", summary="分类统计：无聊邮件占比")
+def categories():
+    s = store()
+    stats = s.category_stats()
+    stats["labels"] = CATEGORY_LABELS
+    stats["threads"] = s.thread_stats()
+    return stats
+
+
 def _truncate(text: str, n: int) -> str:
     if n <= 0 or not text or len(text) <= n:
         return text or ""
@@ -396,6 +598,8 @@ def ai_inbox(
     body_chars: int = Query(default=4000, ge=0, le=200000),
     include_html: bool = False,
     include_inline: bool = Query(default=False, description="内嵌图片（签名 logo 等）是否列入 attachments"),
+    category: str | None = Query(default=None, pattern="^(personal|meeting|automated|promotion)$"),
+    boring: bool | None = Query(default=None, description="true=只要无聊邮件，false=排除无聊邮件"),
     order: str = "desc",
 ):
     s = store()
@@ -413,6 +617,8 @@ def ai_inbox(
         q=q,
         unread_only=unread_only,
         has_attachment=has_attachment,
+        category=category,
+        boring=boring,
         limit=limit,
         offset=offset,
         order=order,
@@ -435,6 +641,12 @@ def ai_inbox(
             "unread": m["unread"],
             "flags": m["flags"],
             "snippet": m["snippet"],
+            # 分类：personal=人工邮件，其余为「无聊邮件」
+            "category": m.get("category") or "personal",
+            "category_label": cat_label(m.get("category") or "personal"),
+            "is_boring": bool(m.get("is_boring")),
+            "mine": is_mine(m),
+            "thread_id": m.get("thread_id") or "",
             "body_text": _truncate(body["body_text"], body_chars),
             # 默认只列真实附件；内嵌图片已在正文里渲染，对 AI 也是噪声
             "attachments": [
@@ -472,6 +684,95 @@ def ai_inbox(
         "count": len(out),
         "next_offset": offset + len(out) if offset + len(out) < total else None,
         "messages": out,
+    }
+
+
+@app.get("/api/ai/threads", summary="AI 入口：会话视图（同一来回聚合，聊天式输出）")
+def ai_threads(
+    since: str | None = Query(default=DEFAULT_SINCE, examples=["2026-07-01"]),
+    until: str | None = None,
+    folder: list[str] | None = Query(default=None, description="默认全部目录；传 all 也是全部"),
+    q: str | None = None,
+    unread_only: bool = False,
+    category: str | None = Query(default=None, pattern="^(personal|meeting|automated|promotion)$"),
+    boring: bool | None = Query(default=None),
+    only_grouped: bool = Query(default=False, description="true=只返回多于一封的会话"),
+    limit: int = Query(default=20, ge=1, le=200),
+    offset: int = 0,
+    body_chars: int = Query(default=1500, ge=0, le=200000),
+    max_messages: int = Query(default=30, ge=1, le=200, description="单条会话最多返回多少封"),
+):
+    s = store()
+    folders = None if not folder or any(f.lower() == "all" for f in folder) else list(folder)
+    _total, threads = s.list_threads(
+        folders=folders,
+        since=since,
+        until=until,
+        q=q,
+        unread_only=unread_only,
+        boring=boring,
+        category=category,
+        own_emails=own_emails(),
+        limit=1000000,
+        offset=0,
+    )
+    out = []
+    for t in threads:
+        if only_grouped and t["message_count"] < 2:
+            continue
+        msgs = t["messages"][-max_messages:]
+        out.append(
+            {
+                "thread_id": t["thread_id"],
+                "subject": t["subject"],
+                "participants": [p["name"] or p["email"] for p in t["participants"]],
+                "message_count": t["message_count"],
+                "unread": t["unread"],
+                "first_date": t["first_date"],
+                "last_date": t["last_date"],
+                "folders": t["folders"],
+                "category": t["category"],
+                "category_label": cat_label(t["category"]),
+                "is_boring": t["is_boring"],
+                "attachment_count": t["attachment_count"],
+                "messages": [
+                    {
+                        "id": m["id"],
+                        "folder": m["folder"],
+                        "uid": m["uid"],
+                        "date": m["date"],
+                        "from": m["from"],
+                        "to": m["to"],
+                        "mine": is_mine(m),
+                        "unread": m["unread"],
+                        "body_text": _truncate(s.get_body(m["folder"], m["uid"])["body_text"], body_chars),
+                        "attachments": [
+                            {
+                                "filename": a["filename"],
+                                "size": a["size"],
+                                "url": att_url(m["folder"], m["uid"], a["index"], "attachment"),
+                            }
+                            for a in s.get_attachments(m["folder"], m["uid"])
+                            if not a["is_inline"]
+                        ],
+                        "url": f"/api/messages/{m['uid']}?folder={m['folder']}",
+                        "web_url": f"/?folder={m['folder']}&uid={m['uid']}",
+                    }
+                    for m in msgs
+                ],
+                "url": f"/api/threads/{t['thread_id']}",
+                "web_url": f"/?thread={t['thread_id']}",
+            }
+        )
+    out = out[offset : offset + limit]
+    return {
+        "account": account().email,
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "query": {"since": since, "until": until, "folder": folders or "all", "q": q,
+                  "boring": boring, "category": category, "only_grouped": only_grouped},
+        "total": _total if not only_grouped else len(out),
+        "count": len(out),
+        "threads": out,
     }
 
 
