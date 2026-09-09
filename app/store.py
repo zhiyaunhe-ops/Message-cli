@@ -323,6 +323,13 @@ class Store:
     def set_flags(self, folder: str, uid: int, flags: list[str]) -> None:
         self._exec("UPDATE messages SET flags=? WHERE folder=? AND uid=?", (" ".join(flags), folder, uid))
 
+    def delete_message(self, folder: str, uid: int) -> None:
+        """邮件已从服务器删除/移走，把本地索引三张表的相关行一并清掉。"""
+        with self._lock:
+            for t in ("messages", "bodies", "attachments"):
+                self.conn.execute(f"DELETE FROM {t} WHERE folder=? AND uid=?", (folder, uid))
+            self.conn.commit()
+
     def stats(self) -> dict:
         row = self.conn.execute(
             "SELECT COUNT(*) AS total, MIN(date_iso) AS oldest, MAX(date_iso) AS newest FROM messages WHERE date_ts>0"

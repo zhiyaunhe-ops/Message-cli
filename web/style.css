@@ -884,3 +884,67 @@ body {
   cursor: pointer;
 }
 [data-theme="terminal"] .theme-crt input { accent-color: var(--accent); }
+
+/* ------------------------------ 删除按钮 / 写邮件模态框 ------------------------------ */
+.btn-danger { color: #d9534f; border-color: rgba(217, 83, 79, 0.55); }
+.btn-danger:hover { background: rgba(217, 83, 79, 0.12); border-color: #d9534f; }
+.bubble-del:hover { color: #d9534f !important; }
+
+.modal-mask {
+  position: fixed; inset: 0;
+  background: rgba(15, 15, 20, 0.45);
+  backdrop-filter: blur(3px);
+  z-index: 300;
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px;
+}
+.modal-mask[hidden] { display: none; }
+.modal {
+  width: min(680px, 94vw);
+  max-height: 90vh;
+  display: flex; flex-direction: column;
+  background: var(--panel);
+  color: var(--text);
+  border: var(--border-w) solid var(--line-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.modal-head {
+  display: flex; align-items: center;
+  padding: 13px 18px;
+  border-bottom: var(--border-w) solid var(--line);
+}
+.modal-head h3 { margin: 0; font-size: 14.5px; flex: 1; }
+.modal-close {
+  border: none; background: transparent;
+  color: var(--text-faint);
+  font-size: 20px; line-height: 1;
+  cursor: pointer; padding: 2px 8px;
+}
+.modal-close:hover { color: var(--accent); }
+#composeForm {
+  display: flex; flex-direction: column; gap: 9px;
+  padding: 15px 18px 16px;
+  overflow-y: auto;
+}
+#composeForm .input { width: 100%; }
+#composeForm textarea.input { resize: vertical; min-height: 120px; font-family: var(--font); line-height: 1.6; }
+.compose-row { display: flex; align-items: center; gap: 10px; min-height: 26px; }
+.file-btn {
+  display: inline-flex; align-items: center;
+  padding: 4px 11px;
+  font-size: 12px;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-sm);
+  color: var(--text-2, var(--text));
+  cursor: pointer;
+  user-select: none;
+}
+.file-btn:hover { border-color: var(--accent); color: var(--accent); }
+.file-names { font-size: 11px; color: var(--text-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.modal-foot {
+  display: flex; align-items: center; gap: 9px;
+  margin-top: 4px;
+}
+.compose-status { flex: 1; font-size: 11.5px; color: #d9534f; overflow-wrap: anywhere; }

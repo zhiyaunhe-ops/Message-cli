@@ -193,6 +193,47 @@ class IMAPClient:
         m = _FLAGS_RE.search(raw.encode())
         return m.group(1).decode().split() if m else []
 
+    # ---------- 写操作 ----------
+    def trash_name(self) -> str | None:
+        """找出服务器上的回收站目录名（配置别名优先）。"""
+        names = {f["name"] for f in self.list_folders()}
+        for cand in (
+            self.account.aliases.get("trash"),
+            "Trash",
+            "Deleted Messages",
+            "Deleted Items",
+            "已删除",
+        ):
+            if cand and cand in names:
+                return cand
+        return None
+
+    def move_to_trash(self, uid: int, folder: str) -> dict:
+        """删除邮件：先 COPY 到回收站（若有），再 \\Deleted + EXPUNGE。"""
+        conn = self.connect()
+        self.select(folder, readonly=False)
+        trash = self.trash_name()
+        copied = False
+        if trash and trash != folder:
+            typ, data = conn.uid("COPY", str(uid), quote_mailbox(trash))
+            copied = typ == "OK"
+            if typ != "OK":
+                raise RuntimeError(f"复制到回收站失败: {data}")
+        typ, data = conn.uid("STORE", str(uid), "+FLAGS", "(\\Deleted)")
+        if typ != "OK":
+            raise RuntimeError(f"标记删除失败: {data}")
+        conn.expunge()
+        return {"ok": True, "uid": uid, "folder": folder, "trash": trash, "copied": copied}
+
+    def append_message(self, raw: bytes, folder: str = "Sent Items", flags: str = "\\Seen") -> int:
+        """把一封邮件（原始字节）APPEND 到服务器目录；返回服务器分配的 UID。"""
+        conn = self.connect()
+        typ, data = conn.append(quote_mailbox(folder), flags, None, raw)
+        if typ != "OK":
+            raise RuntimeError(f"APPEND {folder} 失败: {data}")
+        st = self.status(folder)
+        return max(0, st.get("uidnext", 1) - 1)
+
     # ---------- 内部 ----------
     @staticmethod
     def _parse_envelopes(data) -> list[Envelope]:

@@ -131,6 +131,9 @@ def load_account(name: str | None = None) -> Account:
     if smtp_hostport:
         smtp_host, _, sp = smtp_hostport.partition(":")
         smtp_port = int(sp or 465)
+    else:
+        # 未显式配置 SMTP 时，用 IMAP 同主机 + 465 兜底（Coremail 即如此）
+        smtp_host, smtp_port = host or None, 465
 
     username = _dig(acc_cfg, "imap", "sasl", "login", "username") or acc_cfg.get("email", "")
     pw_cmd = _dig(acc_cfg, "imap", "sasl", "login", "password", "command")

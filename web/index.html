@@ -28,6 +28,7 @@
     </div>
 
     <div class="actions">
+      <button class="btn" id="composeBtn" title="写一封新邮件">✏ 写邮件</button>
       <button class="btn" id="unreadBtn" title="只看未读">未读</button>
       <button class="btn btn-primary" id="syncBtn">同步</button>
       <div class="theme-picker">
@@ -72,6 +73,30 @@
 </div>
 
 <div class="toast" id="toast"></div>
+
+<div class="modal-mask" id="composeModal" hidden>
+  <div class="modal">
+    <div class="modal-head">
+      <h3 id="composeTitle">写邮件</h3>
+      <button class="modal-close" id="composeClose" title="关闭">×</button>
+    </div>
+    <form id="composeForm">
+      <input class="input" id="cTo" placeholder="收件人（多个用逗号分隔）" autocomplete="off" required>
+      <input class="input" id="cCc" placeholder="抄送（可选）" autocomplete="off">
+      <input class="input" id="cSubject" placeholder="主题" autocomplete="off">
+      <textarea class="input" id="cBody" rows="11" placeholder="正文…"></textarea>
+      <div class="compose-row">
+        <label class="file-btn">📎 添加附件<input id="cFiles" type="file" multiple hidden></label>
+        <span class="file-names" id="cFileNames"></span>
+      </div>
+      <div class="modal-foot">
+        <span class="compose-status" id="composeStatus"></span>
+        <button type="button" class="btn" id="composeCancel">取消</button>
+        <button type="submit" class="btn btn-primary" id="sendBtn">发送 ➤</button>
+      </div>
+    </form>
+  </div>
+</div>
 
 <script src="/static/app.js"></script>
 </body>

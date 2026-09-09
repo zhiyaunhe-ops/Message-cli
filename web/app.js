@@ -475,6 +475,18 @@
     extBtn.onclick = () => { state.showExternal = !state.showExternal; renderReader(m); };
     bar.appendChild(extBtn);
 
+    const replyBtn = el("button", "btn", "↩ 回复");
+    replyBtn.onclick = () => openCompose({
+      to: replyTargetOf(m),
+      subject: /^re:/i.test(m.subject || "") ? m.subject : "Re: " + (m.subject || ""),
+      reply: { folder: m.folder, uid: m.uid },
+    });
+    bar.appendChild(replyBtn);
+
+    const delBtn = el("button", "btn btn-danger", "🗑 删除");
+    delBtn.onclick = () => deleteMessage(m.folder, m.uid);
+    bar.appendChild(delBtn);
+
     const unreadBtn = el("button", "btn", m.unread ? "标记已读" : "标记未读");
     unreadBtn.onclick = () => toggleUnread(m, unreadBtn);
     bar.appendChild(unreadBtn);
@@ -711,6 +723,14 @@
         openMessage(last.folder, last.uid, row);
       });
     };
+    const lastIn = [...t.messages].reverse().find((m) => !m.mine) || t.messages[t.messages.length - 1];
+    const replyBtn = el("button", "btn", "↩ 回复");
+    replyBtn.onclick = () => openCompose({
+      to: replyTargetOf(lastIn),
+      subject: /^re:/i.test(t.subject || "") ? t.subject : "Re: " + (t.subject || ""),
+      reply: { folder: lastIn.folder, uid: lastIn.uid },
+    });
+    bar.insertBefore(replyBtn, backBtn);
     bar.appendChild(backBtn);
     reader.appendChild(bar);
 
@@ -785,6 +805,16 @@
       const foot = el("div", "bubble-foot");
       foot.appendChild(el("span", "bubble-folder", folderLabel(m.folder)));
       foot.appendChild(el("span", "bubble-size", `UID ${m.uid}`));
+      const rBtn = el("button", "bubble-open", "↩ 回复");
+      rBtn.onclick = () => openCompose({
+        to: replyTargetOf(m),
+        subject: /^re:/i.test(m.subject || "") ? m.subject : "Re: " + (m.subject || ""),
+        reply: { folder: m.folder, uid: m.uid },
+      });
+      foot.appendChild(rBtn);
+      const dBtn = el("button", "bubble-open bubble-del", "🗑 删除");
+      dBtn.onclick = () => deleteMessage(m.folder, m.uid);
+      foot.appendChild(dBtn);
       const openBtn = el("button", "bubble-open", "查看原文 ⤢");
       openBtn.onclick = () => {
         state.viewMode = "message";
@@ -805,6 +835,83 @@
     inner.appendChild(chat);
     reader.appendChild(inner);
     inner.scrollTop = inner.scrollHeight;
+  }
+
+  /* ------------------------------ 写邮件 / 删除 ------------------------------ */
+  const compose = { reply: null }; // reply = {folder, uid}
+
+  function openCompose(prefill) {
+    prefill = prefill || {};
+    compose.reply = prefill.reply || null;
+    $("#composeTitle").textContent = compose.reply ? "回复邮件" : "写邮件";
+    $("#cTo").value = prefill.to || "";
+    $("#cCc").value = prefill.cc || "";
+    $("#cSubject").value = prefill.subject || "";
+    $("#cBody").value = prefill.body || "";
+    $("#cFiles").value = "";
+    $("#cFileNames").textContent = "";
+    $("#composeStatus").textContent = "";
+    $("#composeModal").hidden = false;
+    setTimeout(() => $("#cTo").focus(), 60);
+  }
+
+  function closeCompose() { $("#composeModal").hidden = true; }
+
+  function replyTargetOf(m) {
+    // 回复对象：自己发的信 -> 回给收件人；别人发的 -> 回给发件人
+    return m.mine || m.folder === "Sent Items" || m.folder === "Drafts"
+      ? ((m.to || []).map((t) => t.email).filter(Boolean).join(", "))
+      : ((m.from || {}).email || "");
+  }
+
+  async function submitCompose(e) {
+    e.preventDefault();
+    const btn = $("#sendBtn");
+    const status = $("#composeStatus");
+    btn.disabled = true;
+    btn.textContent = "发送中…";
+    status.textContent = "";
+    try {
+      const fd = new FormData();
+      fd.set("to", $("#cTo").value.trim());
+      fd.set("cc", $("#cCc").value.trim());
+      fd.set("subject", $("#cSubject").value.trim());
+      fd.set("body", $("#cBody").value);
+      if (compose.reply) {
+        fd.set("reply_folder", compose.reply.folder);
+        fd.set("reply_uid", String(compose.reply.uid));
+      }
+      for (const f of $("#cFiles").files) fd.append("files", f, f.name);
+      const r = await api("/api/send", { method: "POST", body: fd });
+      toast(
+        `✓ 已发送至 ${r.accepted.join("、")}` +
+        (r.sent_uid ? `（副本已存「${folderLabel(r.sent_folder)}」）` : ""),
+        4200
+      );
+      closeCompose();
+      loadFolders();
+      if (state.folder === r.sent_folder) loadCurrent(false);
+    } catch (err) {
+      status.textContent = "发送失败：" + err.message;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "发送 ➤";
+    }
+  }
+
+  async function deleteMessage(folder, uid) {
+    if (!confirm("确定删除这封邮件？将移入服务器的回收站。")) return;
+    try {
+      const r = await api(`/api/messages/${uid}?folder=${encodeURIComponent(folder)}`, { method: "DELETE" });
+      toast(`已移入「${r.trash ? folderLabel(r.trash) : "回收站"}」`);
+      state.current = null;
+      $("#reader").innerHTML =
+        state.viewMode === "thread" ? '<div class="empty">选择一条会话开始阅读</div>' : '<div class="empty">选择一封邮件开始阅读</div>';
+      await loadFolders();
+      await loadCurrent(false);
+    } catch (e) {
+      toast("删除失败：" + e.message);
+    }
   }
 
   /* ------------------------------ 同步 ------------------------------ */
@@ -872,6 +979,17 @@
     $("#moreBtn").addEventListener("click", () => { state.offset += state.limit; loadCurrent(true); });
     $("#syncBtn").addEventListener("click", doSync);
 
+    // 写邮件 / 发送
+    $("#composeBtn").addEventListener("click", () => openCompose());
+    $("#composeClose").addEventListener("click", closeCompose);
+    $("#composeCancel").addEventListener("click", closeCompose);
+    $("#composeModal").addEventListener("click", (e) => { if (e.target.id === "composeModal") closeCompose(); });
+    $("#composeForm").addEventListener("submit", submitCompose);
+    $("#cFiles").addEventListener("change", (e) => {
+      const fs = [...e.target.files];
+      $("#cFileNames").textContent = fs.length ? `已选 ${fs.length} 个：${fs.map((f) => f.name).join("、")}` : "";
+    });
+
     document.querySelectorAll("#viewSeg button").forEach((b) => {
       b.addEventListener("click", () => {
         if (state.viewMode === b.dataset.view) return;
@@ -908,6 +1026,7 @@
 
     document.addEventListener("keydown", (e) => {
       const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName);
+      if (e.key === "Escape" && !$("#composeModal").hidden) { closeCompose(); return; }
       if (e.key === "/" && !typing) { e.preventDefault(); $("#search").focus(); return; }
       if (typing) return;
       if (e.key === "j" || e.key === "ArrowDown" || e.key === "k" || e.key === "ArrowUp") {

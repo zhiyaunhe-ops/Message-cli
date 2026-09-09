@@ -35,6 +35,8 @@
 - GET  /api/messages/{uid}               单封全文；参数 folder/include_body/body_format=text|html|both
 - GET  /api/messages/{uid}/attachment/{index}   下载附件
 - POST /api/messages/{uid}/flags         改标志；body: {folder, add:["\\Seen"], remove:[]}
+- DELETE /api/messages/{uid}?folder=...  删除邮件：COPY 到回收站 + \Deleted + EXPUNGE，本地索引同步清除
+- POST /api/send                         发邮件（SMTP，multipart/form-data）：to(必填)/cc/subject/body/reply_folder/reply_uid/files[]；副本自动 APPEND 回已发送并同步进索引
 - GET  /api/search?q=...                 全文搜索（主题/发件人/收件人/正文）
 - GET  /api/threads                      会话列表；参数 folder/since/until/q/unread_only/boring/category/only_grouped/limit/offset/preview
 - GET  /api/threads/{thread_id}          单条会话全文（按时间顺序，含每封正文与附件）
@@ -53,6 +55,16 @@
 只看人工邮件（滤掉会议通知/系统自动/营销推广）：
 
     curl "http://127.0.0.1:8765/api/ai/inbox?since=2026-07-01&boring=false&limit=100"
+
+发一封带附件的邮件（multipart）：
+
+    curl -X POST "http://127.0.0.1:8765/api/send" \
+      -F "to=someone@example.com" -F "subject=Hi" -F "body=内容" \
+      -F "files=@./report.pdf"
+
+把某封邮件移入回收站：
+
+    curl -X DELETE "http://127.0.0.1:8765/api/messages/1737101991?folder=INBOX"
 
 按会话读全部往返（只看多于一封的会话）：
 

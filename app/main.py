@@ -11,13 +11,14 @@ import time
 from pathlib import Path
 from urllib.parse import quote
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import sync as syncmod
+from . import mailout
 from .classify import CATEGORY_EMOJI, CATEGORY_LABELS, classify, label as cat_label
 from .imap_client import IMAPClient
 from .settings import Account, ROOT, load_account
@@ -157,6 +158,9 @@ def ai_schema():
             {"method": "GET", "path": f"{base}/messages/{{uid}}/attachment/{{index}}", "desc": "下载附件"},
             {"method": "POST", "path": f"{base}/messages/{{uid}}/flags", "desc": "标记已读/未读、加星标",
              "body": {"folder": "INBOX", "add": ["\\Seen"], "remove": []}},
+            {"method": "DELETE", "path": f"{base}/messages/{{uid}}?folder=INBOX", "desc": "删除邮件（COPY 到回收站 + \\Deleted + EXPUNGE）"},
+            {"method": "POST", "path": f"{base}/send", "desc": "发邮件（SMTP 465，multipart；可选附件；副本自动存回已发送）",
+             "fields": ["to(必填,逗号分隔)", "cc", "subject", "body", "reply_folder", "reply_uid", "files[]"]},
             {"method": "GET", "path": f"{base}/folders", "desc": "所有目录及计数 / 同步状态"},
             {"method": "POST", "path": f"{base}/sync", "desc": "从 IMAP 增量同步到本地索引",
              "body": {"folder": "INBOX", "since": DEFAULT_SINCE, "limit": 500, "force": False, "with_body": True}},
@@ -438,6 +442,102 @@ def set_flags(uid: int, req: FlagsRequest):
     except Exception as e:
         raise HTTPException(500, f"设置标志失败: {e}")
     return {"ok": True, "uid": uid, "folder": req.folder, "flags": flags, "unread": "\\Seen" not in flags}
+
+
+@app.delete("/api/messages/{uid}", summary="删除邮件（移入回收站）")
+def trash_message(uid: int, folder: str = "INBOX"):
+    s = store()
+    msg = s.get_message(folder, uid)
+    if not msg:
+        raise HTTPException(404, f"未找到邮件 {folder}:{uid}")
+    try:
+        r = client().move_to_trash(uid, folder)
+    except Exception as e:
+        raise HTTPException(500, f"删除失败: {e}")
+    s.delete_message(folder, uid)  # 服务器已移走，本地索引同步清掉
+    return {"ok": True, "uid": uid, "folder": folder, "trash": r.get("trash"), "copied": r.get("copied")}
+
+
+# ---------------------------------------------------------------- 发信（SMTP）
+@app.post("/api/send", summary="发邮件（SMTP，可选附件，自动存副本到已发送）")
+def send_mail(
+    to: str = Form(..., description="收件人，多个用逗号分隔；支持 Name <a@b.com> 形式"),
+    cc: str = Form("", description="抄送，同上"),
+    subject: str = Form(""),
+    body: str = Form("", description="纯文本正文；直接换行即分段"),
+    reply_folder: str = Form("", description="若为回复：原信所在目录"),
+    reply_uid: int = Form(0, description="若为回复：原信 UID"),
+    files: list[UploadFile] = File(default=[], description="附件，可多个"),
+):
+    acc = account()
+    s = store()
+
+    in_reply_to, references = "", ""
+    orig_subject = ""
+    orig_from = ""
+    orig_date = ""
+    if reply_folder and reply_uid:
+        orig = s.get_message(reply_folder, reply_uid)
+        if orig:
+            orig_subject = orig.get("subject") or ""
+            orig_from = f'{(orig.get("from") or {}).get("name", "")} <{(orig.get("from") or {}).get("email", "")}>'
+            orig_date = orig.get("date") or ""
+            if orig.get("message_id"):
+                in_reply_to = references = orig["message_id"]
+
+    attachments: list[tuple[str, str, bytes]] = []
+    for f in files or []:
+        try:
+            data = f.file.read()  # 同步句柄，线程池端点里安全
+        finally:
+            try:
+                f.file.close()
+            except Exception:
+                pass
+        attachments.append((f.filename or "attachment.bin", f.content_type or "application/octet-stream", data))
+
+    # 回复时默认带引用头
+    text = body or ""
+    if reply_folder and reply_uid and orig_subject and not subject:
+        subject = orig_subject if orig_subject.lower().startswith("re:") else f"Re: {orig_subject}"
+    if in_reply_to and orig_from:
+        quoted = "\n".join(f"> {ln}" for ln in (s.get_body(reply_folder, reply_uid)["body_text"] or "").splitlines()[:20])
+        text = f"{text}\n\n----- 原始邮件 -----\n发件人: {orig_from}\n时间: {orig_date}\n主题: {orig_subject}\n\n{quoted}"
+
+    try:
+        msg = mailout.build_message(
+            acc, to=to, subject=subject, body_text=text,
+            cc=cc, attachments=attachments, in_reply_to=in_reply_to, references=references,
+        )
+        raw = msg.as_bytes()
+        result = mailout.send_message(acc, msg)
+    except mailout.MailOutError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"发送失败: {e}")
+
+    # 副本存回已发送并同步到本地索引
+    sent_folder = acc.aliases.get("sent", "Sent Items")
+    sent_uid = None
+    try:
+        sent_uid = client().append_message(raw, sent_folder)
+    except Exception as e:
+        _state["log"].append(f"append sent failed: {e}")
+    try:
+        c = client()
+        syncmod.sync_folder(c, s, sent_folder, since=time.strftime("%Y-%m-%d"))
+        c.close()
+    except Exception as e:
+        _state["log"].append(f"sent sync failed: {e}")
+
+    return {
+        "ok": True,
+        "message_id": result["message_id"],
+        "accepted": result["accepted"],
+        "sent_folder": sent_folder,
+        "sent_uid": sent_uid,
+        "web_url": f"/?folder={sent_folder}&uid={sent_uid}" if sent_uid else None,
+    }
 
 
 @app.get("/api/search", summary="全文搜索")
