@@ -942,6 +942,10 @@ body {
   padding: 15px 18px 16px;
   overflow-y: auto;
 }
+/* 列方向 flex 容器的子项默认 flex-shrink:1 —— 内容比可用高度高时，浏览器会把子项「压扁」
+   而不是让 overflow-y:auto 滚动，被压扁的子项内容（收件人 chip / AI 方案）就溢出并压到
+   下一个字段上。手机端弹窗是 height:100dvh，回复全部十来人必踩。锁死子项高度，让表单自己滚。 */
+#composeForm > *, #settingsForm > * { flex: 0 0 auto; }
 #composeForm .input { width: 100%; }
 #composeForm textarea.input { resize: vertical; min-height: 120px; font-family: var(--font); line-height: 1.6; }
 
