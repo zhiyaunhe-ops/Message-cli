@@ -94,10 +94,18 @@ def ai_schema():
             {"method": "PUT", "path": f"{base}/config/ai", "desc": "改 AI 配置（base_url/api_key/model/temperature/timeout…）"},
             {"method": "POST", "path": f"{base}/config/ai/test", "desc": "测试 AI 接口连通性"},
             {"method": "GET", "path": f"{base}/folders", "desc": "所有目录及计数 / 同步状态"},
+            {"method": "DELETE", "path": f"{base}/folders/{{name}}", "desc": "删除一个目录（服务器 + 本地索引；系统目录不可删；?local_only=true 只清本地，?empty=false 禁止先清空）"},
+            {"method": "GET", "path": f"{base}/accounts", "desc": "邮箱账号列表 + 当前选中的那个"},
+            {"method": "POST", "path": f"{base}/accounts", "desc": "新增邮箱账号", "body": {"name": "work", "email": "a@b.com", "imap_host": "imap.example.com", "imap_port": 993, "password": "..."}},
+            {"method": "PUT", "path": f"{base}/accounts/{{name}}", "desc": "修改邮箱账号（password 留空=不改）"},
+            {"method": "DELETE", "path": f"{base}/accounts/{{name}}", "desc": "删除邮箱账号（?purge=true 连本地索引库一起删）"},
+            {"method": "POST", "path": f"{base}/accounts/{{name}}/activate", "desc": "切换当前邮箱账号（换本地索引库）"},
+            {"method": "POST", "path": f"{base}/accounts/{{name}}/test", "desc": "测试该账号 IMAP 连通性"},
             {"method": "GET", "path": f"{base}/contacts", "desc": "联系人联想：从历史邮件汇总的收件人/抄送候选（写信补全用）",
              "params": ["q", "limit"]},
             {"method": "POST", "path": f"{base}/sync", "desc": "从 IMAP 增量同步到本地索引",
-             "body": {"folder": "INBOX", "since": DEFAULT_SINCE, "limit": 500, "force": False, "with_body": True}},
+             "body": {"folder": "INBOX", "since": DEFAULT_SINCE, "limit": syncmod.DEFAULT_ENVELOPE_LIMIT,
+                      "force": False, "with_body": True}},
             {"method": "GET", "path": f"{base}/status", "desc": "服务与索引健康状态"},
         ],
         "tips": [
@@ -135,6 +143,8 @@ def status(
         "service": "message-webui",
         "modules": modules_overview(),
         "account": {"name": acc.name, "email": acc.email, "display_name": acc.display_name},
+        "accounts": _safe_accounts(),
+        "active_account": acc.name,
         "imap": {"host": acc.imap_host, "port": acc.imap_port, "ssl": acc.imap_ssl},
         "smtp": {"host": acc.smtp_host, "port": acc.smtp_port, "ssl": acc.smtp_ssl},
         "stats": s.stats(),
@@ -146,6 +156,16 @@ def status(
         "log": app_ctx.sync.recent_log(20),
         "cache_keys": app_ctx.cache.keys(),
     }
+
+
+def _safe_accounts() -> list[dict]:
+    """账号清单（不含明文密码）；读配置失败不该让 /api/status 整个倒掉。"""
+    try:
+        from .settings import list_accounts
+
+        return list_accounts()
+    except Exception:
+        return []
 
 
 MODULES_TTL = 60        # 微信可用性自检（要打开本机微信库）缓存秒数
@@ -223,6 +243,66 @@ def folders(refresh: bool = Query(False, description="跳过缓存，强制回�
     return {"folders": out, "count": len(out), "cached": not refresh and CACHE_KEY_FOLDERS_REMOTE in ctx.cache.keys()}
 
 
+# 不允许通过接口删掉的「系统目录」（收件箱 + 会话配置里用到的别名目录）
+_PROTECTED_ALIASES = ("inbox", "sent", "drafts", "trash")
+
+
+def _protected_folders() -> set[str]:
+    acc = account()
+    out = {"INBOX"}
+    for key in _PROTECTED_ALIASES:
+        v = acc.aliases.get(key)
+        if v:
+            out.add(v)
+    return out
+
+
+@router.delete("/api/folders/{folder:path}", summary="删除目录（服务器 + 本地索引，不可逆）")
+def delete_folder(
+    folder: str,
+    local_only: bool = Query(False, description="只清本地索引，不动服务器目录"),
+    empty: bool = Query(True, description="直接删不动时，先清空目录里的邮件再删（多数服务端要求目录为空）"),
+):
+    """把一个目录从服务器和本地索引里移除。
+
+    收件箱以及别名里配置的已发送/草稿/回收站不允许删除 —— 那些是发信流程要用的。
+    """
+    s = store()
+    if folder in _protected_folders():
+        raise HTTPException(400, f"「{folder}」是系统目录，不能删除")
+    known = {f["name"] for f in s.list_folders()}
+    remote = remote_folders()
+    if folder not in known and folder not in remote:
+        raise HTTPException(404, f"未找到目录「{folder}」")
+
+    server = {"ok": False, "skipped": True}
+    if not local_only:
+        try:
+            with ctx.imap_write() as c:
+                try:
+                    server = c.delete_folder(folder)
+                except Exception as first:
+                    # Coremail 这类服务端不允许删非空目录（"DELETE can't delete mailbox
+                    # with letter in it"）。既然用户要连邮件一起删，就先清空再删。
+                    if not empty:
+                        raise
+                    ctx.sync.log_add(f"目录 {folder} 直接删除失败（{first}），改为先清空再删")
+                    purged = c.purge_folder(folder)
+                    server = c.delete_folder(folder)
+                    server["purged"] = purged["purged"]
+        except Exception as e:
+            raise HTTPException(500, f"服务器端删除失败：{e}")
+    local = s.drop_folder(folder)
+    ctx.cache.invalidate(CACHE_KEY_FOLDERS_REMOTE)      # 目录清单变了
+    ctx.cache.invalidate(CACHE_KEY_CONTACTS)
+    ctx.sync.log_add(
+        f"删除目录 {folder}（服务器清空 {server.get('purged', 0)} 封，本地移除 {local['removed']} 行）"
+        if not local_only else
+        f"删除目录 {folder}（仅本地，移除 {local['removed']} 行）"
+    )
+    return {"ok": True, "folder": folder, "server": server, "local": local}
+
+
 # ---------------------------------------------------------------- 联系人联想
 CACHE_KEY_CONTACTS = "mail:contacts"
 CONTACTS_TTL = 600      # 本地聚合，纯 CPU；同步/发信后会主动失效
@@ -272,7 +352,7 @@ def list_contacts(
 class SyncRequest(BaseModel):
     folder: str | list[str] | None = None
     since: str | None = DEFAULT_SINCE
-    limit: int = 500
+    limit: int = syncmod.DEFAULT_ENVELOPE_LIMIT   # 单目录单轮处理上限，即「信箱容量」
     body_limit: int | None = None
     force: bool = False
     with_body: bool = True
@@ -547,9 +627,12 @@ def send_mail(
     # 已发出 -> 草稿箱里的那一版没用了，直接清掉（失败不影响发信结果）
     draft_removed = False
     if draft_uid:
+        dfolder = draft_folder or acc.aliases.get("drafts", "Drafts")
         try:
             with ctx.imap_write() as c:
-                c.delete_message(draft_uid, draft_folder or acc.aliases.get("drafts", "Drafts"))
+                c.delete_message(draft_uid, dfolder)
+            # 服务器删掉了还不够：前端读的是本地索引，不一起清掉草稿箱里还会留着这一版
+            s.delete_message(dfolder, draft_uid)
             draft_removed = True
         except Exception as e:
             ctx.sync.log_add(f"draft cleanup failed: {e}")

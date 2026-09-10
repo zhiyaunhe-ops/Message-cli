@@ -10,6 +10,10 @@ from . import mailparse, settings
 from .imap_client import IMAPClient, imap_since
 from .store import Store
 
+# 单目录单轮最多处理多少封（按 UID 倒序取最新的）。
+# 这决定了「信箱容量」：本地索引与正文抓取都以它为上限，改大后需要重新同步才生效。
+DEFAULT_ENVELOPE_LIMIT = 5000
+
 _UNSAFE = re.compile(r'[^\w\u4e00-\u9fff.\-()\[\]]+')
 
 
@@ -45,7 +49,7 @@ def sync_folder(
     store: Store,
     folder: str,
     since: str | None = None,
-    envelope_limit: int = 500,
+    envelope_limit: int = DEFAULT_ENVELOPE_LIMIT,
     body_limit: int | None = None,
     force: bool = False,
     with_body: bool = True,
@@ -54,7 +58,7 @@ def sync_folder(
     """同步单个目录。
 
     since: 'YYYY-MM-DD'，只对该日期之后的邮件抓取完整正文与附件
-    envelope_limit: 单目录单轮最多处理多少封（按 UID 倒序取最新的）
+    envelope_limit: 单目录单轮最多处理多少封（按 UID 倒序取最新的），默认 5000
     force: 忽略本地已有记录，重新抓取
     """
     t0 = time.time()
@@ -254,7 +258,7 @@ def sync_all(
     store: Store,
     folders: list[str] | None = None,
     since: str | None = None,
-    envelope_limit: int = 500,
+    envelope_limit: int = DEFAULT_ENVELOPE_LIMIT,
     body_limit: int | None = None,
     force: bool = False,
     with_body: bool = True,

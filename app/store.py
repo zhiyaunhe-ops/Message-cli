@@ -191,6 +191,17 @@ class Store:
             self.conn.execute("DELETE FROM attachments WHERE folder=?", (name,))
             self.conn.commit()
 
+    def drop_folder(self, name: str) -> dict:
+        """整个目录从本地索引里移除（服务器目录已删/不再同步时用）。"""
+        with self._lock:
+            removed = 0
+            for t in ("messages", "bodies", "attachments"):
+                cur = self.conn.execute(f"DELETE FROM {t} WHERE folder=?", (name,))
+                removed += cur.rowcount or 0
+            self.conn.execute("DELETE FROM folders WHERE name=?", (name,))
+            self.conn.commit()
+            return {"folder": name, "removed": removed}
+
     def folder_counts(self, name: str) -> dict:
         row = self.conn.execute(
             "SELECT COUNT(*) AS total, SUM(CASE WHEN flags NOT LIKE '%\\Seen%' THEN 1 ELSE 0 END) AS unread "

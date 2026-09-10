@@ -20,6 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
+from .api_accounts import router as accounts_router
 from .api_ai import router as ai_router
 from .api_mail import modules_overview, remote_folders
 from .api_mail import router as mail_router
@@ -92,6 +93,7 @@ app.add_middleware(
 
 # ---------------------------------------------------------------- 路由装配
 app.include_router(mail_router)
+app.include_router(accounts_router)
 app.include_router(wechat_router)
 app.include_router(ai_router)
 

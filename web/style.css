@@ -360,7 +360,48 @@ body {
   flex: 0 0 auto;
 }
 .brand h1 { margin: 0; font-size: 15px; font-weight: var(--weight-head); letter-spacing: 0.02em; }
-.brand .account { margin: 1px 0 0; font-size: 11.5px; color: var(--text-faint); }
+/* 顶栏的邮箱切换器：收起时就是一行小字，点开是账号下拉 */
+.account-picker { position: relative; margin-top: 1px; }
+.account-btn {
+  display: inline-flex; align-items: center; max-width: 268px;
+  padding: 1px 4px; margin: 0 0 0 -4px;
+  border: none; background: transparent; border-radius: 6px;
+  color: var(--text-faint); font-family: inherit; font-size: 11.5px; line-height: 1.5;
+  cursor: pointer;
+}
+.account-btn:hover { color: var(--accent); background: var(--hover); }
+.account-btn #account { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.account-btn .caret { flex: 0 0 auto; }
+.account-menu {
+  position: absolute; left: 0; top: calc(100% + 8px);
+  min-width: 288px; max-width: 344px;
+  background: var(--panel);
+  border: var(--border-w) solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 6px; z-index: 60; display: none;
+}
+.account-menu.open { display: block; }
+.account-opt {
+  display: flex; align-items: center; gap: 9px; width: 100%;
+  padding: 8px 10px; border: none; background: transparent;
+  border-radius: var(--radius-sm); cursor: pointer; text-align: left;
+  color: var(--text); font-family: inherit;
+}
+.account-opt:hover { background: var(--hover); }
+.account-opt.is-active { background: var(--accent-soft); }
+.account-opt-main { min-width: 0; flex: 1; }
+.account-opt-name { font-size: 12.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.account-opt-sub { font-size: 10.5px; color: var(--text-faint); margin-top: 2px; }
+.account-check { color: var(--accent); font-size: 13px; opacity: 0; flex: 0 0 auto; }
+.account-opt.is-active .account-check { opacity: 1; }
+.account-menu-foot { margin-top: 5px; padding-top: 5px; border-top: var(--border-w) solid var(--line); }
+.account-manage {
+  width: 100%; padding: 8px 10px; border: none; background: transparent;
+  color: var(--text-dim); font-family: inherit; font-size: 12px;
+  border-radius: var(--radius-sm); cursor: pointer; text-align: left;
+}
+.account-manage:hover { background: var(--hover); color: var(--accent); }
 
 .search-wrap { flex: 1; display: flex; gap: 8px; max-width: 620px; }
 .input, .select {
@@ -471,6 +512,7 @@ body {
 }
 #folders { list-style: none; margin: 0; padding: 0; }
 .folder-item {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -487,6 +529,15 @@ body {
 .folder-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .folder-count { font-size: 11px; color: var(--text-faint); font-variant-numeric: tabular-nums; }
 .folder-item.is-active .folder-count { color: var(--accent); }
+/* 删除目录（服务器 + 本地，不可逆）：悬停才露出来，系统目录不渲染这个按钮 */
+.folder-del {
+  position: absolute; right: 7px; top: 50%; transform: translateY(-50%);
+  border: none; background: var(--panel); color: var(--text-faint);
+  font-size: 14px; line-height: 1; cursor: pointer;
+  padding: 2px 5px; border-radius: 5px; opacity: 0;
+}
+.folder-item:hover .folder-del { opacity: 1; }
+.folder-del:hover { color: #d9534f; background: var(--hover); }
 
 .side-stats {
   margin-top: 18px;
@@ -1143,6 +1194,41 @@ body {
 .switch input { accent-color: var(--accent); }
 .settings-meta { font-size: 11px; color: var(--text-faint); overflow-wrap: anywhere; }
 
+/* ------------------------------ 邮箱账号管理 ------------------------------ */
+.modal-wide { width: min(880px, 95vw); }
+.accounts-wrap {
+  display: grid; grid-template-columns: 258px 1fr;
+  flex: 1; min-height: 0;
+}
+.accounts-wrap > * { min-height: 0; }
+.accounts-list {
+  border-right: var(--border-w) solid var(--line);
+  overflow-y: auto; padding: 10px;
+}
+.acc-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 9px 10px; border-radius: var(--radius-sm); cursor: pointer;
+}
+.acc-item:hover { background: var(--hover); }
+.acc-item.is-active { background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent); }
+.acc-item-main { min-width: 0; flex: 1; }
+.acc-item-name { font-size: 12.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acc-item-sub { font-size: 10.5px; color: var(--text-faint); margin-top: 2px; }
+.acc-item-del {
+  border: none; background: transparent; color: var(--text-faint);
+  font-size: 15px; line-height: 1; cursor: pointer; padding: 2px 5px; opacity: 0;
+}
+.acc-item:hover .acc-item-del { opacity: 1; }
+.acc-item-del:hover { color: #d9534f; }
+#accountForm {
+  display: flex; flex-direction: column; gap: 9px;
+  padding: 15px 18px 16px; overflow-y: auto;
+}
+/* 同 #composeForm：别让 flex 把字段压扁（详见上面那段注释） */
+#accountForm > * { flex: 0 0 auto; }
+.field-grid.cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.acc-switches { display: flex; flex-wrap: wrap; gap: 8px 18px; }
+
 /* ============================================================
    微信统计视图（新页签）
    ============================================================ */
@@ -1356,7 +1442,9 @@ body[data-app="wechat"] #syncBtn { display: none; }
   .brand { min-width: 0; flex: 0 1 auto; }
   .brand-mark { width: 30px; height: 30px; font-size: 15px; }
   .brand h1 { font-size: 14px; }
-  .brand .account { display: none; }
+  .account-btn { max-width: 128px; font-size: 11px; }
+  .account-btn .caret { display: none; }
+  .account-menu { min-width: min(288px, 86vw); }
   .app-seg { margin-left: auto; }
   .app-seg button { padding: 5px 10px; font-size: 12px; }
   .search-wrap { order: 5; flex: 1 1 100%; max-width: none; gap: 6px; }
@@ -1427,9 +1515,24 @@ body[data-app="wechat"] #syncBtn { display: none; }
     border: none; border-radius: 0;
   }
   .modal-head { padding: 11px 14px; }
-  #composeForm, #settingsForm { padding: 12px 14px 16px; gap: 8px; }
+  #composeForm, #settingsForm, #accountForm { padding: 12px 14px 16px; gap: 8px; }
   #composeForm textarea.input { min-height: 150px; }
   .field-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  /* 邮箱管理：账号列表改成横滑胶囊，表单接在下面 */
+  .accounts-wrap { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
+  .accounts-list {
+    display: flex; gap: 6px; padding: 8px;
+    border-right: none; border-bottom: var(--border-w) solid var(--line);
+    overflow-x: auto; overflow-y: hidden;
+  }
+  .acc-item {
+    flex: 0 0 auto; min-width: 148px;
+    background: var(--panel-2); border: var(--border-w) solid var(--line);
+  }
+  .acc-item.is-active { box-shadow: inset 0 0 0 1px var(--accent); }
+  .acc-item-del { opacity: 1; }
+  .acc-switches { gap: 8px 14px; }
+  .folder-del { display: none; }   /* 手机上目录是横滑胶囊，没地方放手势删除 */
   .modal-foot { flex-wrap: wrap; row-gap: 6px; }
   .modal-foot .btn { flex: 1 1 auto; }
   .compose-status { flex: 1 1 100%; }

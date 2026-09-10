@@ -14,6 +14,9 @@
   后三类合称「无聊邮件」（`is_boring=true`），可用 `?boring=true/false` 或 `?category=` 过滤。
 - `thread_id` 会话 ID：同一来回复用一封（含 In-Reply-To 串联 + 主题/参与者归并），形如 `t`+14 位十六进制。
 - `mine`：true 表示该邮件是本人发出的（发件人是自己，或位于已发送/草稿目录）。
+- **多邮箱**：本服务可配多个 IMAP 账号，每个账号有各自独立的本地索引库。所有接口都作用于
+  **当前选中的那个账号**（`GET /api/accounts` 的 `active`）。切换账号用
+  `POST /api/accounts/{name}/activate`，切换后目录 / 邮件 / 联系人 / 统计全部换成新账号的。
 
 ## 推荐调用顺序
 
@@ -26,10 +29,17 @@
 
 ## 端点清单
 
-- GET  /api/status                       服务、账号、各目录计数、分类统计、会话统计
+- GET  /api/status                       服务、账号、各目录计数、分类统计、会话统计；含 accounts（全部邮箱账号）与 active_account（当前生效的那个）
 - GET  /api/folders                      目录列表（含总数/未读数）
+- DELETE /api/folders/{name}             删除目录（服务器 + 本地索引，不可逆）；系统目录（收件箱/已发送/草稿/回收站）拒绝；参数 local_only=true 只清本地，empty=false 禁止「先清空再删」（部分服务端如 Coremail 要求目录为空才允许 DELETE，默认会先清空目录里的邮件）
+- GET  /api/accounts                     邮箱账号列表 + 当前账号；返回 {active, count, accounts:[{name,email,display_name,username,imap,smtp,aliases,default,has_password,db}], file}（不含明文密码）
+- POST /api/accounts                     新增邮箱账号；body: {name, email, display_name, imap_host, imap_port, imap_ssl, username, password, smtp_host, smtp_port, smtp_ssl, smtp_starttls, aliases:{inbox,sent,drafts,trash}, default}；带密码的新账号会直接切过去
+- PUT  /api/accounts/{name}              修改邮箱账号（password 留空 = 不改）
+- DELETE /api/accounts/{name}            删除邮箱账号；?purge=true 连本地索引库一起删（至少保留一个账号）
+- POST /api/accounts/{name}/activate     切换当前账号（换本地索引库、清缓存）
+- POST /api/accounts/{name}/test         真连一次 IMAP 验证凭据；返回目录数与样例目录名
 - GET  /api/contacts                     联系人联想；参数 q（姓名/邮箱片段，可空格分词）/limit；返回 [{name,email,count,weight,addressed,last_ts}]，按「我写过信的人 → 往来频次」排序，写信收件人/抄送补全用
-- POST /api/sync                         增量同步；body: {folder|all_folders, since, limit, force, with_body}
+- POST /api/sync                         增量同步；body: {folder|all_folders, since, limit, force, with_body}；limit 为单目录单轮处理上限（默认 5000，即信箱容量）
 - POST /api/reindex                      重建派生索引（分类+会话归组）；body: {classify_all, rebuild}
 - GET  /api/categories                   分类统计：无聊邮件占比、各类数量、会话数
 - GET  /api/messages                     信封列表；参数 folder/since/until/q/unread_only/has_attachment/category/boring/limit/offset/order

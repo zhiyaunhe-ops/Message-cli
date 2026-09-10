@@ -39,3 +39,44 @@ mailbox.alias.inbox = "INBOX"
 mailbox.alias.sent = "Sent"
 mailbox.alias.drafts = "Drafts"
 mailbox.alias.trash = "Trash"
+
+# ============================================================
+# 多邮箱：再加一个 [accounts.<名字>] 就是第二个邮箱
+# ============================================================
+# 名字（英文标识，只允许字母/数字/._-）决定两件事：
+#   1) 密码文件名         -> config/himalaya/secret-<名字>
+#   2) 本地索引库文件名   -> data/mail-<名字>.db
+# 每个账号有各自独立的收件箱/已发送/草稿/联系人/统计，WebUI 顶栏可以随时切换。
+#
+# 密码按账号各取各的，优先级：
+#   1) 环境变量 MAIL_PASSWORD_<名字大写>（非字母数字换成下划线）
+#   2) imap.sasl.login.password.command 指向的脚本
+#   3) config/himalaya/secret-<名字>
+#   4) 仅当「只有一个账号」或该账号 default=true：MAIL_PASSWORD → secret
+#
+# 加完新账号记得同步一次，它的本地索引库是空的：
+#   python run.py sync --all-folders --since 2026-07-01
+
+# [accounts.personal]
+# email = "me@gmail.com"
+# display-name = "Me"
+# imap.server = "imap.gmail.com:993"
+# imap.sasl.login.username = "me@gmail.com"
+# smtp.server = "smtp.gmail.com:465"
+# smtp.ssl = true
+# # Gmail 的目录名和别的服务商不一样，必须显式映射，否则找不到已发送/草稿：
+# mailbox.alias.inbox = "INBOX"
+# mailbox.alias.sent = "[Gmail]/Sent Mail"
+# mailbox.alias.drafts = "[Gmail]/Drafts"
+# mailbox.alias.trash = "[Gmail]/Trash"
+# # Gmail 不接受账号密码，要去 Google 账号里生成「应用专用密码」填进
+# # config/himalaya/secret-personal
+#
+# [accounts.qq]
+# email = "me@qq.com"
+# imap.server = "imap.qq.com:993"
+# smtp.server = "smtp.qq.com:465"
+# mailbox.alias.sent = "Sent Messages"
+#
+# 提示：WebUI 的「邮箱管理」弹窗能增删改这些账号（保存时会整份重写 config.toml，
+# 手写的注释会丢），日常改配置用界面更省事。

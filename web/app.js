@@ -28,6 +28,13 @@
     viewMode: "message",    // message | thread
     category: "all",        // all | personal | boring | meeting | automated | promotion
     me: "",                 // 自己的地址（回复全部时要把自己剔掉）
+    // —— 多邮箱 ——
+    // accounts      : /api/accounts 的账号摘要列表（不含明文密码）
+    // activeAccount : 当前生效的账号名；accountEdit: 邮箱管理弹窗里正在编辑的账号名（"" = 新增）
+    accounts: [],
+    activeAccount: "",
+    accountsFile: "",
+    accountEdit: "",
     // —— 微信模块 ——
     // hideOfficial: 过滤公众号/系统通知；cat: 分类筛选；kwMine: 词云口径
     wechat: {
@@ -38,9 +45,10 @@
     // reply : {folder, uid} 表示这封是回复
     // draft : {folder, uid} 服务器草稿箱里对应的那一版（自动保存时替换它，避免堆积）
     // dirty : 内容被改过，需要落草稿；timer: 防抖句柄
+    // saving: 正在路上的那次自动保存（发送前要 await 它，见 submitCompose）
     // files : 已添加的附件（File 对象数组，自己维护才能逐个移除）
     // ai    : 最近一次 AI 生成的结果，收起面板后仍留着，可以再展开
-    compose: { reply: null, draft: null, dirty: false, timer: null, sending: false, files: [], ai: null },
+    compose: { reply: null, draft: null, dirty: false, timer: null, saving: null, sending: false, files: [], ai: null },
   };
 
   const DRAFT_DEBOUNCE = 1800;  // 停止输入 1.8s 后自动存草稿
@@ -232,8 +240,38 @@
       li.appendChild(el("span", "folder-name", folderLabel(f.name)));
       li.appendChild(el("span", "folder-count", f.unread ? `${f.total} · ${f.unread} 未读` : String(f.total)));
       li.addEventListener("click", () => selectFolder(f.name));
+      // 系统目录（收件箱 / 已发送 / 草稿 / 回收站）后端不允许删，这里也不渲染按钮
+      if (!PROTECTED_FOLDERS.has(f.name)) {
+        const del = el("button", "folder-del", "×");
+        del.type = "button";
+        del.title = `删除目录「${f.name}」`;
+        del.addEventListener("click", (e) => {
+          e.stopPropagation();          // 别顺带切到该目录
+          deleteFolder(f);
+        });
+        li.appendChild(del);
+      }
       ul.appendChild(li);
     });
+  }
+
+  /** 与前端的发信流程耦合的系统目录：和后端 /api/folders 的保护名单保持一致。 */
+  const PROTECTED_FOLDERS = new Set(["INBOX", "Sent Items", "Drafts", "Trash", "已发送", "草稿箱", "已删除"]);
+
+  async function deleteFolder(f) {
+    if (!confirm(
+      `删除目录「${f.name}」？\n\n` +
+      `会同时删除服务器上的这个目录（连同里面 ${f.total || 0} 封邮件）和本地索引，不可逆。\n` +
+      `服务器端删除失败就只清本地。`
+    )) return;
+    try {
+      const r = await api(`/api/folders/${encodeURIComponent(f.name)}`, { method: "DELETE" });
+      toast(`已删除「${f.name}」（本地清掉 ${r.local ? r.local.removed : 0} 行）`, 4000);
+      if (state.folder === f.name) selectFolder("INBOX");
+      await loadFolders();
+    } catch (e) {
+      toast("删除目录失败：" + e.message, 5000);
+    }
   }
 
   function selectFolder(name) {
@@ -1310,19 +1348,29 @@
     clearTimeout(state.compose.timer);
     state.compose.dirty = false;
     const d = state.compose.draft;
+    // 存成「可等待的一次任务」挂在 state 上：发送时必须先等它回来，
+    // 才知道这次自动保存最终落到了哪个 uid（否则它会晚于发送登记，多留一版草稿）。
+    const job = (async () => {
+      try {
+        const r = await jsonPost("/api/drafts", Object.assign({}, f, {
+          draft_folder: d ? d.folder : "",
+          draft_uid: d ? d.uid : 0,
+        }));
+        state.compose.draft = { folder: r.folder, uid: r.uid };
+        setDraftStatus(`草稿已存「${folderLabel(r.folder)}」 ${r.saved_at}`);
+        if (state.folder === r.folder && state.viewMode === "message") loadCurrent(false);
+        return state.compose.draft;
+      } catch (err) {
+        state.compose.dirty = true;   // 存失败就留着标记，下次再试
+        setDraftStatus("草稿保存失败：" + err.message);
+        return null;
+      }
+    })();
+    state.compose.saving = job;
     try {
-      const r = await jsonPost("/api/drafts", Object.assign({}, f, {
-        draft_folder: d ? d.folder : "",
-        draft_uid: d ? d.uid : 0,
-      }));
-      state.compose.draft = { folder: r.folder, uid: r.uid };
-      setDraftStatus(`草稿已存「${folderLabel(r.folder)}」 ${r.saved_at}`);
-      if (state.folder === r.folder && state.viewMode === "message") loadCurrent(false);
-      return state.compose.draft;
-    } catch (err) {
-      state.compose.dirty = true;   // 存失败就留着标记，下次再试
-      setDraftStatus("草稿保存失败：" + err.message);
-      return null;
+      return await job;
+    } finally {
+      if (state.compose.saving === job) state.compose.saving = null;
     }
   }
 
@@ -1338,6 +1386,7 @@
     state.compose.reply = prefill.reply || null;
     state.compose.draft = prefill.draft || null;
     state.compose.dirty = false;
+    state.compose.saving = null;
     state.compose.sending = false;
     state.compose.files = [];
     state.compose.ai = null;
@@ -1541,6 +1590,288 @@
     }
   }
 
+  /* ------------------------------ 邮箱账号（多邮箱） ------------------------------ */
+
+  /** 拉一次账号列表；顶栏那个小字也在这里更新。 */
+  async function loadAccounts() {
+    try {
+      const r = await api("/api/accounts");
+      state.accounts = r.accounts || [];
+      state.activeAccount = r.active || "";
+      state.accountsFile = r.file || "";
+      paintAccountLabel();
+    } catch (e) {
+      state.accounts = [];
+    }
+    return state.accounts;
+  }
+
+  function activeAccountInfo() {
+    return state.accounts.find((a) => a.name === state.activeAccount) || null;
+  }
+
+  function paintAccountLabel() {
+    const a = activeAccountInfo() || state.accounts[0];
+    $("#account").textContent = a ? (a.email || a.name) : "未配置邮箱";
+  }
+
+  /** 顶栏下拉：所有账号 + 一行「管理邮箱账号」。 */
+  function buildAccountMenu() {
+    const menu = $("#accountMenu");
+    menu.innerHTML = "";
+    if (!state.accounts.length) {
+      menu.appendChild(el("div", "account-opt-sub", "还没有可用的邮箱账号"));
+    }
+    state.accounts.forEach((a) => {
+      const b = el("button", "account-opt" + (a.name === state.activeAccount ? " is-active" : ""));
+      b.type = "button";
+      const box = el("div", "account-opt-main");
+      box.appendChild(el("div", "account-opt-name", a.email || a.name));
+      const tags = [a.name];
+      if (a.default) tags.push("默认");
+      if (!a.has_password) tags.push("未设密码");
+      box.appendChild(el("div", "account-opt-sub", tags.join(" · ")));
+      b.appendChild(box);
+      b.appendChild(el("span", "account-check", "✓"));
+      b.addEventListener("click", () => { menu.classList.remove("open"); switchAccount(a.name); });
+      menu.appendChild(b);
+    });
+    const foot = el("div", "account-menu-foot");
+    const manage = el("button", "account-manage", "⚙ 管理邮箱账号…");
+    manage.type = "button";
+    manage.addEventListener("click", () => { menu.classList.remove("open"); openAccounts(); });
+    foot.appendChild(manage);
+    menu.appendChild(foot);
+  }
+
+  /** 切换账号 = 换一整套后端状态（索引库 / 缓存 / 目录），最稳的是整页重载。 */
+  async function switchAccount(name) {
+    if (name === state.activeAccount) return;
+    try {
+      const r = await api(`/api/accounts/${encodeURIComponent(name)}/activate`, { method: "POST" });
+      try { sessionStorage.setItem("mail.flash", `已切换到 ${r.email || name}`); } catch (e) {}
+      location.reload();
+    } catch (e) {
+      toast("切换账号失败：" + e.message, 5000);
+    }
+  }
+
+  /* ---- 邮箱管理弹窗 ---- */
+
+  async function openAccounts() {
+    $("#accountsModal").hidden = false;
+    $("#accountStatus").textContent = "";
+    $("#accountsList").innerHTML = '<div class="empty">加载中…</div>';
+    await loadAccounts();
+    paintAccountsList();
+    buildAccountMenu();
+    fillAccountForm(activeAccountInfo() || state.accounts[0] || null);
+  }
+
+  function closeAccounts() { $("#accountsModal").hidden = true; }
+
+  function paintAccountsList() {
+    const box = $("#accountsList");
+    box.innerHTML = "";
+    if (!state.accounts.length) {
+      box.innerHTML = '<div class="empty">还没有配置邮箱账号</div>';
+      return;
+    }
+    state.accounts.forEach((a) => {
+      const row = el("div", "acc-item" + (a.name === state.activeAccount ? " is-active" : ""));
+      const main = el("div", "acc-item-main");
+      main.appendChild(el("div", "acc-item-name", a.email || a.name));
+      const tags = [a.name];
+      if (a.default) tags.push("默认");
+      if (!a.has_password) tags.push("未设密码");
+      main.appendChild(el("div", "acc-item-sub", tags.join(" · ")));
+      row.appendChild(main);
+      const del = el("button", "acc-item-del", "×");
+      del.type = "button";
+      del.title = "删除这个账号";
+      del.addEventListener("click", (e) => { e.stopPropagation(); removeAccount(a); });
+      row.appendChild(del);
+      row.addEventListener("click", () => fillAccountForm(a));
+      box.appendChild(row);
+    });
+  }
+
+  /** 把一份账号摘要填进右侧表单；传 null = 清空成「新增」。 */
+  function fillAccountForm(a) {
+    state.accountEdit = a ? a.name : "";
+    const imap = (a && a.imap) || {};
+    const smtp = (a && a.smtp) || {};
+    const al = (a && a.aliases) || {};
+    $("#accName").value = a ? a.name : "";
+    $("#accName").disabled = !!a;                 // 名字是主键，改名等于新建一个
+    $("#accEmail").value = (a && a.email) || "";
+    $("#accDisplay").value = (a && a.display_name) || "";
+    $("#accUser").value = (a && a.username) || "";
+    $("#accImapHost").value = imap.host || "";
+    $("#accImapPort").value = imap.port || 993;
+    $("#accSmtpHost").value = smtp.host || "";
+    $("#accSmtpPort").value = smtp.port || 465;
+    $("#accImapSsl").checked = a ? !!imap.ssl : true;
+    $("#accSmtpSsl").checked = a ? !!smtp.ssl : true;
+    $("#accDefault").checked = !!(a && a.default);
+    $("#accAliasInbox").value = al.inbox || "";
+    $("#accAliasSent").value = al.sent || "";
+    $("#accAliasDrafts").value = al.drafts || "";
+    $("#accAliasTrash").value = al.trash || "";
+    $("#accPassword").value = "";
+    $("#accPassword").placeholder = (a && a.has_password)
+      ? "已保存（留空 = 不修改）"
+      : "留空 = 不修改 / 未设置";
+    $("#accSaveBtn").textContent = a ? "保存账号" : "新增账号";
+    $("#accountMeta").textContent = a
+      ? `本地索引库：${a.db || "-"}`
+      : "填好后点「新增账号」，会写进 config/himalaya/config.toml（已 gitignore）";
+    $("#accountStatus").textContent = "";
+    $("#accountStatus").classList.remove("is-ok");
+  }
+
+  function accountPayload() {
+    const iAlias = (sel) => $(sel).value.trim();
+    return {
+      name: $("#accName").value.trim() || state.accountEdit,
+      email: $("#accEmail").value.trim(),
+      display_name: $("#accDisplay").value.trim(),
+      username: $("#accUser").value.trim(),
+      imap_host: $("#accImapHost").value.trim(),
+      imap_port: parseInt($("#accImapPort").value, 10) || 993,
+      imap_ssl: $("#accImapSsl").checked,
+      smtp_host: $("#accSmtpHost").value.trim(),
+      smtp_port: parseInt($("#accSmtpPort").value, 10) || 465,
+      smtp_ssl: $("#accSmtpSsl").checked,
+      password: $("#accPassword").value,
+      default: $("#accDefault").checked,
+      aliases: {
+        inbox: iAlias("#accAliasInbox"),
+        sent: iAlias("#accAliasSent"),
+        drafts: iAlias("#accAliasDrafts"),
+        trash: iAlias("#accAliasTrash"),
+      },
+    };
+  }
+
+  function validateAccount(p, st) {
+    if (!p.name) { st.textContent = "账号名（英文标识）不能为空"; return false; }
+    if (!p.email) { st.textContent = "邮箱地址不能为空"; return false; }
+    if (!p.imap_host) { st.textContent = "IMAP 服务器不能为空"; return false; }
+    return true;
+  }
+
+  /** 保存一次账号（新增或修改）。返回 true 表示落盘成功。 */
+  async function saveAccount(st) {
+    const p = accountPayload();
+    if (!validateAccount(p, st)) return false;
+    if (state.accountEdit) {
+      await jsonPost(`/api/accounts/${encodeURIComponent(state.accountEdit)}`, p, { method: "PUT" });
+    } else {
+      await jsonPost("/api/accounts", p);
+      state.accountEdit = p.name;
+      $("#accName").disabled = true;
+    }
+    $("#accPassword").value = "";
+    await loadAccounts();
+    paintAccountsList();
+    return true;
+  }
+
+  async function submitAccount(e) {
+    e.preventDefault();
+    const st = $("#accountStatus");
+    const btn = $("#accSaveBtn");
+    st.classList.remove("is-ok");
+    btn.disabled = true;
+    const label = btn.textContent;
+    btn.textContent = "保存中…";
+    try {
+      const created = !state.accountEdit;
+      if (!await saveAccount(st)) return;
+      if (created) {
+        // 后端把新账号切成了当前账号 —— 整个页面的世界都变了，重载最干净
+        const info = state.accounts.find((x) => x.name === state.accountEdit);
+        try {
+          sessionStorage.setItem("mail.flash",
+            `已新增并切换到 ${(info && info.email) || state.accountEdit}`);
+        } catch (e) {}
+        location.reload();
+        return;
+      }
+      fillAccountForm(state.accounts.find((a) => a.name === state.accountEdit) || null);
+      st.textContent = "✓ 已保存";
+      st.classList.add("is-ok");
+      toast("邮箱账号已保存");
+      await refreshAfterAccountChange();
+    } catch (err) {
+      st.classList.remove("is-ok");
+      st.textContent = "保存失败：" + err.message;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = label;
+    }
+  }
+
+  async function testAccount() {
+    const btn = $("#accTestBtn");
+    const st = $("#accountStatus");
+    const p = accountPayload();
+    if (!p.imap_host) { st.textContent = "先填 IMAP 服务器"; return; }
+    btn.disabled = true;
+    const label = btn.textContent;
+    btn.textContent = "测试中…";
+    st.classList.remove("is-ok");
+    try {
+      // 不落盘、不切账号：纯粹验这组凭据能不能连上
+      const r = await jsonPost("/api/accounts/test", p);
+      const samples = (r.samples || []).slice(0, 4).join(" / ");
+      st.textContent = `✓ 连接正常：${r.folders} 个目录（${r.elapsed}s）${samples ? " · " + samples : ""}`;
+      st.classList.add("is-ok");
+    } catch (err) {
+      st.classList.remove("is-ok");
+      st.textContent = "测试失败：" + err.message;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = label;
+    }
+  }
+
+  async function removeAccount(a) {
+    if (!confirm(`删除邮箱账号「${a.name}」？\n\n账号配置和它的密码文件会被删除，服务器上的邮件不受影响。`)) return;
+    const purge = confirm(
+      `还要不要连本地索引库一起删掉？\n\n确定 = 一并删除（索引里的邮件列表会丢，重新添加后要重新同步）\n取消 = 保留本地索引库`
+    );
+    const wasActive = a.name === state.activeAccount;
+    try {
+      const r = await api(
+        `/api/accounts/${encodeURIComponent(a.name)}?purge=${purge ? "true" : "false"}`,
+        { method: "DELETE" }
+      );
+      if (wasActive) {
+        // 删掉的是当前账号 —— 后端会自动落到另一个账号上，重载免得前后端不一致
+        try { sessionStorage.setItem("mail.flash", `已删除 ${a.name}，当前账号切到 ${r.active}`); } catch (e) {}
+        location.reload();
+        return;
+      }
+      toast(`已删除账号 ${a.name}` + (r.removed_db ? "（含本地索引）" : ""), 4000);
+      state.accountEdit = "";
+      await refreshAfterAccountChange();
+      paintAccountsList();
+      fillAccountForm(activeAccountInfo() || state.accounts[0] || null);
+    } catch (e) {
+      toast("删除账号失败：" + e.message, 5000);
+    }
+  }
+
+  /** 账号被改了之后，当前账号的世界可能变了 —— 先把账号信息拉回来，再刷侧栏 / 列表 / 状态。 */
+  async function refreshAfterAccountChange() {
+    await loadStatus();                    // 顺带更新 state.accounts / activeAccount
+    buildAccountMenu();
+    await loadFolders();
+    await loadCurrent(false);
+  }
+
   /* ------------------------------ 设置（AI 接口） ------------------------------ */
 
   async function openSettings(hint) {
@@ -1630,8 +1961,13 @@
       chips.to.focus();
       return;
     }
-    state.compose.sending = true;
+    state.compose.sending = true;        // 先立旗：发送期间不再产生新的自动保存
     clearTimeout(state.compose.timer);   // 别让待触发的自动保存插在发送中间
+    // 已经上路的那次自动保存要等回来 —— 它稍后返回的新草稿 uid 会覆盖 state.compose.draft，
+    // 如果不等，本次发送登记的仍是旧 uid，发完草稿箱里就多出一版（AI 生成完接着点发送最容易踩）。
+    if (state.compose.saving) {
+      try { await state.compose.saving; } catch (e) {}
+    }
     btn.disabled = true;
     btn.textContent = "发送中…";
     setComposeStatus("");
@@ -1715,7 +2051,12 @@
     try {
       const s = await api("/api/status");
       state.me = (s.account && s.account.email) || "";
-      $("#account").textContent = s.account.email;
+      // /api/status 顺带回带账号清单，省掉一次 /api/accounts 往返
+      if (Array.isArray(s.accounts) && s.accounts.length) {
+        state.accounts = s.accounts;
+        state.activeAccount = s.active_account || (s.account && s.account.name) || "";
+      }
+      paintAccountLabel();
       const st = s.stats || {};
       const c = s.categories || {};
       const th = s.threads || {};
@@ -1726,7 +2067,7 @@
         (st.oldest ? `最早 <b>${st.oldest.slice(0, 10)}</b><br>` : "") +
         `快捷键 <b>J/K</b> 切换 · <b>/</b> 搜索`;
     } catch (e) {
-      $("#account").textContent = "未连接";
+      if (!state.accounts.length) $("#account").textContent = "未连接";
     }
   }
 
@@ -1813,6 +2154,19 @@
     $("#settingsForm").addEventListener("submit", submitSettings);
     $("#cfgTest").addEventListener("click", testSettings);
 
+    // 邮箱账号：顶栏下拉 + 管理弹窗
+    $("#accountBtn").addEventListener("click", (e) => {
+      e.stopPropagation();
+      const m = $("#accountMenu");
+      if (!m.classList.contains("open")) buildAccountMenu();
+      m.classList.toggle("open");
+    });
+    $("#accountsClose").addEventListener("click", closeAccounts);
+    bindMaskClose("#accountsModal", closeAccounts);
+    $("#accountForm").addEventListener("submit", submitAccount);
+    $("#accNewBtn").addEventListener("click", () => fillAccountForm(null));
+    $("#accTestBtn").addEventListener("click", testAccount);
+
     // 关页面/刷新时，把还在写的内容用 sendBeacon 存进草稿箱
     window.addEventListener("beforeunload", () => {
       if ($("#composeModal").hidden || !state.compose.dirty) return;
@@ -1890,12 +2244,18 @@
     $("#themeBtn").addEventListener("click", (e) => { e.stopPropagation(); menu.classList.toggle("open"); });
     document.addEventListener("click", (e) => {
       if (!menu.contains(e.target)) menu.classList.remove("open");
+      const am = $("#accountMenu");
+      if (am.classList.contains("open")
+          && !am.contains(e.target) && !$("#accountBtn").contains(e.target)) {
+        am.classList.remove("open");
+      }
     });
 
     document.addEventListener("keydown", (e) => {
       const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName);
       if (e.key === "Escape" && !$("#composeModal").hidden) { closeCompose(); return; }
       if (e.key === "Escape" && !$("#settingsModal").hidden) { closeSettings(); return; }
+      if (e.key === "Escape" && !$("#accountsModal").hidden) { closeAccounts(); return; }
       if (e.key === "/" && !typing) { e.preventDefault(); $("#search").focus(); return; }
       if (typing) return;
       if (e.key === "j" || e.key === "ArrowDown" || e.key === "k" || e.key === "ArrowUp") {
@@ -2489,6 +2849,16 @@
 
     bind();
     loadStatus();
+    loadAccounts().then(buildAccountMenu);   // 顶栏账号下拉；和 loadStatus 并行
+
+    // 切换账号后是整页重载，用 sessionStorage 把提示语带过来
+    try {
+      const flash = sessionStorage.getItem("mail.flash");
+      if (flash) {
+        sessionStorage.removeItem("mail.flash");
+        setTimeout(() => toast(flash, 4000), 300);
+      }
+    } catch (e) {}
 
     // 微信侧偏好：公众号过滤默认开（这类推送基本是噪音），可手动关掉并记住
     try {

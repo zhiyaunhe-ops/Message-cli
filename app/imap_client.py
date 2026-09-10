@@ -235,6 +235,42 @@ class IMAPClient:
         conn.expunge()
         return {"ok": True, "uid": uid, "folder": folder}
 
+    def purge_folder(self, name: str, chunk: int = 200) -> dict:
+        """清空目录里的全部邮件（\\Deleted + EXPUNGE，不进回收站）。
+
+        有些服务端（Coremail）要求目录为空才允许 DELETE，删目录前要先走这一步。
+        调用方已经决定连邮件一起删掉，这里不再往回收站留副本。
+        收尾的 CLOSE 把连接退回「已认证但未选中」，否则紧随其后的 DELETE 会被拒。
+        """
+        if name.strip().upper() == "INBOX":
+            raise RuntimeError("不能清空收件箱")
+        conn = self.connect()
+        self.select(name, readonly=False)
+        uids = self.search_uids(["ALL"])
+        for i in range(0, len(uids), chunk):
+            batch = uids[i : i + chunk]
+            typ, data = conn.uid("STORE", ",".join(str(u) for u in batch), "+FLAGS", "(\\Deleted)")
+            if typ != "OK":
+                raise RuntimeError(f"标记删除失败: {data}")
+        if uids:
+            conn.expunge()
+        conn.close()
+        return {"folder": name, "purged": len(uids)}
+
+    def delete_folder(self, name: str) -> dict:
+        """删除服务器上的一个目录（不可逆）。
+
+        连接处于「已认证但未选中」状态时才能 DELETE，所以这里用新连接、
+        且不做 select —— ctx.imap() 拿到的正是这种连接。
+        """
+        if name.strip().upper() == "INBOX":
+            raise RuntimeError("不能删除收件箱")
+        conn = self.connect()
+        typ, data = conn.delete(quote_mailbox(name))
+        if typ != "OK":
+            raise RuntimeError(f"删除目录 {name} 失败: {data}")
+        return {"ok": True, "folder": name}
+
     def append_message(self, raw: bytes, folder: str = "Sent Items", flags: str = "\\Seen") -> int:
         """把一封邮件（原始字节）APPEND 到服务器目录；返回服务器分配的 UID。"""
         conn = self.connect()

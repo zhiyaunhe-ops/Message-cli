@@ -17,6 +17,8 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from typing import Any, Iterator
 
+from . import appstate
+from . import settings
 from .imap_client import IMAPClient
 from .settings import Account, load_account
 from .store import Store
@@ -108,6 +110,7 @@ class AppContext:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._account: Account | None = None
+        self._account_name: str = ""      # 运行时选中的账号；空 = 用配置里的 default
         self._store: Store | None = None
         self._wx_app: Any = None
 
@@ -117,17 +120,58 @@ class AppContext:
         self.write_lock = threading.RLock()
 
     # ---------------- 账号 / 索引 ----------------
+    def account_name(self) -> str:
+        """当前生效的账号名：运行时选中的 > state.json 记着的 > 配置 default > 第一个。"""
+        with self._lock:
+            names = settings.accounts()
+            if self._account_name and self._account_name in names:
+                return self._account_name
+            saved = appstate.get("active_account")
+            if saved and saved in names:
+                self._account_name = saved
+                return saved
+            self._account_name = settings.default_account_name()
+            return self._account_name
+
     def account(self) -> Account:
         with self._lock:
             if self._account is None:
-                self._account = load_account()
+                self._account = load_account(self.account_name())
             return self._account
 
     def store(self) -> Store:
         with self._lock:
             if self._store is None:
-                self._store = Store()
+                self._store = Store(settings.db_path_for(self.account_name()))
             return self._store
+
+    def _drop_account_locked(self) -> None:
+        """丢掉当前账号的缓存与连接（切换 / 配置变更时用）。"""
+        if self._store is not None:
+            self._store.close()
+            self._store = None
+        self._account = None
+
+    def switch_account(self, name: str) -> dict:
+        """切换到另一个邮箱账号：换库、清缓存，下一次请求就是新账号的世界。"""
+        with self._lock:
+            if name not in settings.accounts():
+                raise KeyError(name)
+            self._drop_account_locked()
+            self._account_name = name
+            appstate.set("active_account", name)
+            self.cache.invalidate()      # 目录清单 / 联系人 / 模块自检都跟着账号走
+            self.sync.last_sync = None
+            acc = self.account()
+            self.sync.log_add(f"切换邮箱 -> {name} <{acc.email}>")
+            return {"name": name, "email": acc.email, "display_name": acc.display_name}
+
+    def reload_accounts(self) -> None:
+        """账号被增删改后调用：丢掉缓存，让下一次请求重新读配置。"""
+        with self._lock:
+            self._drop_account_locked()
+            settings.invalidate_config()
+            self.cache.invalidate()
 
     @property
     def own_emails(self) -> set[str]:
@@ -172,6 +216,7 @@ class AppContext:
             if self._store is not None:
                 self._store.close()
                 self._store = None
+            self._account = None
             self._wx_app = None
             self.cache.invalidate()
             self.sync.clear_log()
@@ -183,6 +228,10 @@ ctx = AppContext()
 # ------------------------------------------------------------------ 便捷函数
 def account() -> Account:
     return ctx.account()
+
+
+def account_name() -> str:
+    return ctx.account_name()
 
 
 def store() -> Store:

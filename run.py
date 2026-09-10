@@ -15,12 +15,24 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from app import appstate  # noqa: E402
 from app import sync as syncmod  # noqa: E402
 from app.imap_client import IMAPClient  # noqa: E402
-from app.settings import load_account  # noqa: E402
+from app.settings import accounts, db_path_for, default_account_name, load_account  # noqa: E402
 from app.store import Store  # noqa: E402
 
 DEFAULT_SINCE = "2026-07-01"
+
+
+def active_account_name(explicit: str | None = None) -> str:
+    """CLI 用的当前账号：命令行指定 > state.json 记着的 > 配置里的 default。"""
+    names = accounts()
+    if explicit and explicit in names:
+        return explicit
+    saved = appstate.get("active_account")
+    if saved and saved in names:
+        return saved
+    return default_account_name()
 
 
 def cmd_serve(args):
@@ -30,9 +42,10 @@ def cmd_serve(args):
 
 
 def cmd_sync(args):
-    acc = load_account()
+    acc = load_account(active_account_name(getattr(args, "account", None)))
     client = IMAPClient(acc)
-    store = Store()
+    store = Store(db_path_for(acc.name))
+    print(f"账号 {acc.name} <{acc.email}> · 本地库 {store.db_path}", flush=True)
     if args.all_folders or not args.folder:
         targets = [f["name"] for f in client.list_folders()]
     else:
@@ -68,7 +81,9 @@ def cmd_sync(args):
 
 
 def cmd_verify(args):
-    store = Store()
+    name = active_account_name(getattr(args, "account", None))
+    store = Store(db_path_for(name))
+    print(f"账号 {name} · 本地库 {store.db_path}")
     folders = [f["name"] for f in store.list_folders()]
     rows = []
     total = 0
@@ -235,14 +250,17 @@ def main():
     y = sub.add_parser("sync", help="同步邮件到本地索引")
     y.add_argument("--folder", action="append", help="可重复；不指定则同步全部目录")
     y.add_argument("--all-folders", action="store_true")
+    y.add_argument("--account", default=None, help="指定邮箱账号（默认用当前选中的）")
     y.add_argument("--since", default=DEFAULT_SINCE)
-    y.add_argument("--limit", type=int, default=500)
+    y.add_argument("--limit", type=int, default=syncmod.DEFAULT_ENVELOPE_LIMIT,
+                   help="单个目录单轮最多处理多少封（默认 5000，即信箱容量上限）")
     y.add_argument("--body-limit", type=int, default=None)
     y.add_argument("--force", action="store_true")
     y.add_argument("--no-body", action="store_true", help="只抓信封不抓正文")
     y.set_defaults(func=cmd_sync)
 
     v = sub.add_parser("verify", help="校验时间窗内的邮件")
+    v.add_argument("--account", default=None, help="指定邮箱账号（默认用当前选中的）")
     v.add_argument("--since", default=DEFAULT_SINCE)
     v.add_argument("--json", action="store_true")
     v.set_defaults(func=cmd_verify)
