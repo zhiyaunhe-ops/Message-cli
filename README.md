@@ -18,14 +18,21 @@
 # 1. 安装依赖（建议先建虚拟环境）
 pip install -r requirements.txt
 
-# 2. 同步邮件到本地索引（首次约 30s）
+# 2. 配置邮箱：复制模板后填入自己的账号与密码
+cp config/himalaya/config.example.toml config/himalaya/config.toml
+cp config/himalaya/secret.example     config/himalaya/secret      # 写入 IMAP 密码
+
+# 3. 同步邮件到本地索引（首次约 30s）
 python run.py sync --since 2026-07-01 --all-folders
 
-# 3. 启动 WebUI + API（默认 127.0.0.1:8765）
+# 4. 启动 WebUI + API（默认 127.0.0.1:8765）
 python run.py serve --host 127.0.0.1 --port 8765
 ```
 
 副命令：`sync` / `verify` / `ai` / `wechat` —— 见 `python run.py -h`。
+
+密码优先级：`MAIL_PASSWORD` 环境变量 > 配置里的 `password.command` > `config/himalaya/secret` 文件。
+真实的 `config.toml` 与 `secret` 都已 gitignore，仓库里只有 `.example` 模板。
 
 ## 服务结构（单进程、双模块）
 
@@ -147,8 +154,10 @@ Sent Items   17 封   正文 17   附件 29   日期 2026-07-08 → 2026-09-09
 ```
 Message-cli/
 ├─ config/
-│  ├─ himalaya/{config.toml, secret}       # IMAP 配置（secret 不入库）
-│  └─ app.example.toml                     # 应用配置模板（AI Key 等）
+│  ├─ himalaya/
+│  │  ├─ config.example.toml    # IMAP/SMTP 配置模板（复制为 config.toml）
+│  │  └─ secret.example         # 密码文件模板（复制为 secret）
+│  └─ app.example.toml          # 应用配置模板（AI Key 等）
 ├─ app/
 │  ├─ main.py            # 装配层：app 实例 / CORS / 静态 / 首页 / 生命周期
 │  ├─ context.py         # 统一运行上下文 ctx（账号 / Store / IMAP / 缓存 / 日志）

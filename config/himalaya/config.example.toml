@@ -1,0 +1,41 @@
+# ============================================================
+# IMAP / SMTP 配置模板 —— 复制为 config.toml 后填入你自己的账号
+#   cp config/himalaya/config.example.toml config/himalaya/config.toml
+#   cp config/himalaya/secret.example     config/himalaya/secret    # 写入密码
+#
+# config.toml 与 secret 都已 gitignore，不会入库。
+# 密码优先级：MAIL_PASSWORD 环境变量 > password.command > secret 文件
+# ============================================================
+# 配置格式沿用 Himalaya v2 的命名习惯（https://github.com/pimalaya/himalaya）
+
+[accounts.example]
+email = "user@example.com"
+display-name = "Your Name"
+default = true
+
+# ------------------------------------------------------------
+# IMAP（993 端口为隐式 TLS）
+# ------------------------------------------------------------
+imap.server = "imap.example.com:993"
+imap.sasl.login.username = "user@example.com"
+
+# 方式一：用外部命令取密码（适合密码存在别处的场景）
+# imap.sasl.login.password.command = ["/path/to/your-pass-script.sh"]
+
+# 注意：部分服务器（如 Coremail）不接受内联发送凭据，需等待服务端 continuation
+# imap.sasl-ir = false
+
+# ------------------------------------------------------------
+# SMTP（465 端口为隐式 TLS）
+# ------------------------------------------------------------
+smtp.server = "smtp.example.com:465"
+smtp.ssl = true
+
+# ------------------------------------------------------------
+# 邮箱别名：把友好名映射到服务器上的真实目录名
+# 目录名因服务商而异，先用 python run.py sync --dry-run 之类的方式确认
+# ------------------------------------------------------------
+mailbox.alias.inbox = "INBOX"
+mailbox.alias.sent = "Sent"
+mailbox.alias.drafts = "Drafts"
+mailbox.alias.trash = "Trash"
