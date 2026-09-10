@@ -953,6 +953,8 @@ body {
    微信统计视图（新页签）
    ============================================================ */
 .app-seg { flex: 0 0 auto; }
+/* .wx / .layout 有 display:flex，会盖掉 UA 的 [hidden]{display:none}，这里强制兜底 */
+[hidden] { display: none !important; }
 body[data-app="wechat"] .search-wrap,
 body[data-app="wechat"] #composeBtn,
 body[data-app="wechat"] #unreadBtn,
