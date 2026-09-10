@@ -15,10 +15,13 @@
 ## 启动
 
 ```bash
-# 同步邮件到本地索引（首次约 30s）
+# 1. 安装依赖（建议先建虚拟环境）
+pip install -r requirements.txt
+
+# 2. 同步邮件到本地索引（首次约 30s）
 python run.py sync --since 2026-07-01 --all-folders
 
-# 启动 WebUI + API（默认 127.0.0.1:8765）
+# 3. 启动 WebUI + API（默认 127.0.0.1:8765）
 python run.py serve --host 127.0.0.1 --port 8765
 ```
 
@@ -57,6 +60,9 @@ WebUI 的「💬 微信」页签读的是本机微信（Weixin.exe）的加密�
 **只读、不写微信数据**。启用步骤：
 
 ```bash
+# 0. 安装外部项目 wechat-cli（提供 wechat_cli 包，见文末「参考项目」）
+pip install "wechat-cli @ git+https://github.com/huohuoer/wechat-cli"
+
 # 1. 微信保持登录，提取数据库密钥（扫描进程内存，约 3 秒）
 wechat-cli init
 
@@ -72,8 +78,9 @@ python run.py wechat --days 7 --keywords --limit 30  # 关键词词云
 python run.py wechat --days 30 --keywords --category project   # 只看项目群
 ```
 
-`app/wechat.py` 复用 `source/wechat_cli` 的解密与查询内核（若环境里已装 `wechat-cli` 包则优先用包）。
-密钥/配置在 `~/.wechat-cli/`，不在本仓库内。微信数据不可用时接口返回 `503`，邮件功能不受影响。
+`app/wechat.py` 复用了 **[wechat-cli](https://github.com/huohuoer/wechat-cli)** 的解密与查询内核
+（`wechat_cli.core.*`），只读本机微信数据库、不写入。密钥/配置在 `~/.wechat-cli/`，不在本仓库内。
+微信数据不可用时接口返回 `503`，邮件功能不受影响。
 
 ### 会话分类规则（`app/wechat_classify.py`）
 
@@ -139,23 +146,56 @@ Sent Items   17 封   正文 17   附件 29   日期 2026-07-08 → 2026-09-09
 
 ```
 Message-cli/
-├─ config/himalaya/{config.toml, secret}   # IMAP 配置（备份解压后整理）
+├─ config/
+│  ├─ himalaya/{config.toml, secret}       # IMAP 配置（secret 不入库）
+│  └─ app.example.toml                     # 应用配置模板（AI Key 等）
 ├─ app/
-│  ├─ settings.py      # 配置加载，密码读取（环境变量/secret/命令）
-│  ├─ imap_client.py   # IMAP 连接与抓取封装
-│  ├─ mailparse.py     # RFC822 → 结构化 dict（含 GBK 回退）
-│  ├─ store.py         # SQLite 缓存（信封 / 正文 / 附件）
-│  ├─ sync.py          # 增量同步
-│  └─ main.py          # FastAPI 路由
+│  ├─ main.py            # 装配层：app 实例 / CORS / 静态 / 首页 / 生命周期
+│  ├─ context.py         # 统一运行上下文 ctx（账号 / Store / IMAP / 缓存 / 日志）
+│  ├─ api_mail.py        # 邮件路由
+│  ├─ api_wechat.py      # 微信路由
+│  ├─ api_ai.py          # AI 配置 + AI 写正文路由
+│  ├─ ai.py              # OpenAI 兼容 /chat/completions 调用
+│  ├─ appconfig.py       # config/app.toml 读写
+│  ├─ settings.py        # IMAP/SMTP 配置与密码读取
+│  ├─ imap_client.py     # IMAP 连接与抓取封装
+│  ├─ mailparse.py       # RFC822 → 结构化 dict（含 GBK 回退）
+│  ├─ mailout.py         # SMTP 发信
+│  ├─ store.py           # SQLite 索引（信封 / 正文 / 附件 / 会话）
+│  ├─ sync.py            # 增量同步
+│  ├─ classify.py        # 无聊邮件规则分类
+│  ├─ threads.py         # 会话归组（并查集）
+│  ├─ wechat.py          # 微信数据访问（依赖外部 wechat-cli）
+│  └─ wechat_classify.py # 微信会话分类（纯函数）
 ├─ web/
-│  ├─ index.html       # SPA 容器
-│  ├─ style.css        # 5 套主题
-│  ├─ app.js           # 列表 / 搜索 / 阅读 / 同步
-│  └─ llms.txt         # 给 AI 看的接口说明
-├─ data/
-│  ├─ mail.db          # 本地索引
-│  ├─ attachments/     # 附件文件
-│  └─ shots/           # 5 主题截图
-├─ run.py              # CLI: serve / sync / verify / ai
+│  ├─ index.html         # SPA 容器
+│  ├─ style.css          # 5 套主题
+│  ├─ app.js             # 列表 / 搜索 / 阅读 / 阅读器 / 微信看板
+│  ├─ icon.png           # favicon
+│  └─ llms.txt           # 给 AI 看的接口说明
+├─ scripts/              # Windows 启动与托盘（PowerShell / VBS）
+├─ assets/               # 应用图标
+├─ data/                 # 运行期生成（mail.db / attachments / shots，不入库）
+├─ run.py                # CLI: serve / sync / verify / ai / wechat
+├─ requirements.txt
 └─ README.md
 ```
+
+## 参考项目与致谢
+
+本项目在「微信统计」模块复用了第三方开源项目的解密与查询内核，特此致谢：
+
+| 项目 | 说明 | 许可 |
+| --- | --- | --- |
+| [**wechat-cli**](https://github.com/huohuoer/wechat-cli) | 命令行查询本地微信数据（专为 LLM 集成设计）。本项目通过 `wechat_cli.core.*` 复用了它的密钥提取、SQLCipher 解密与 `Msg_*` 分表查询能力 | Apache-2.0 |
+| [wechat-decrypt](https://github.com/ylytdeng/wechat-decrypt) | wechat-cli 的上游，提供微信数据库解密与数据解析的核心能力（本项目间接受益） | 见上游仓库 |
+| [Himalaya](https://github.com/pimalaya/himalaya) | 邮件 CLI，本项目 `config/himalaya/` 的 IMAP 配置格式来源 | MIT OR Apache-2.0 |
+
+安装 wechat-cli：
+
+```bash
+pip install "wechat-cli @ git+https://github.com/huohuoer/wechat-cli"
+# 或使用 npm 版本：npm i -g @canghe_ai/wechat-cli
+```
+
+> 本项目与上述项目无隶属关系；《微信》数据库仅在本机只读解密，密钥保存在 `~/.wechat-cli/`，不入库、不上传。

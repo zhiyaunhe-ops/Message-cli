@@ -57,13 +57,16 @@ def _load_mods():
     try:
         import wechat_cli  # noqa: F401
     except ImportError:
-        if not SOURCE_DIR.exists():
+        # 开发者可能把 wechat-cli 源码树放在项目根的 source/ 下（非必须）
+        if SOURCE_DIR.exists():
+            sys.path.insert(0, str(SOURCE_DIR))
+        try:
+            import wechat_cli  # noqa: F401
+        except ImportError as exc:
             raise WechatError(
-                "未找到 wechat_cli。请在 mailui 环境里 pip install -e source，"
-                "或确认 source/wechat_cli 源码树存在。"
-            )
-        sys.path.insert(0, str(SOURCE_DIR))
-        import wechat_cli  # noqa: F401
+                "未找到 wechat_cli 包。请先安装外部依赖 wechat-cli："
+                'pip install "wechat-cli @ git+https://github.com/huohuoer/wechat-cli"'
+            ) from exc
 
     from wechat_cli.core.config import STATE_DIR, load_config
     from wechat_cli.core.contacts import get_contact_names, get_self_username

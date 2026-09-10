@@ -1,0 +1,20 @@
+# Message-cli 核心依赖
+# 安装： pip install -r requirements.txt
+
+# Web 服务
+fastapi>=0.110
+uvicorn>=0.27
+python-multipart>=0.0.9        # 写邮件上传附件
+
+# 微信统计（可选模块，不装则微信页签返回 503，邮件功能不受影响）
+pycryptodome>=3.19             # SQLCipher 解密
+zstandard>=0.22                # 微信消息体 zstd 解压
+jieba>=0.42                    # 关键词词云分词（未装则退回 CJK 二元组）
+
+# 外部项目：wechat-cli（提供 wechat_cli 包，微信数据解密/查询内核）
+# 参考项目 / 已致谢：https://github.com/huohuoer/wechat-cli  (Apache-2.0)
+# wechat-cli @ git+https://github.com/huohuoer/wechat-cli
+
+# 开发可选
+# watchfiles>=0.21             # uvicorn --reload
+# websockets>=12               # WebSocket 支持
