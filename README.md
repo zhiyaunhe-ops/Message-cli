@@ -21,6 +21,33 @@ python run.py serve --host 127.0.0.1 --port 8765
 
 副命令：`sync` / `verify` / `ai` / `wechat` —— 见 `python run.py -h`。
 
+## 服务结构（单进程、双模块）
+
+**只有一个服务**：邮件和微信跑在同一个 FastAPI 进程、同一个端口上，共享一份运行上下文。
+
+```
+app/
+├── main.py          装配层：app 实例 / CORS / 静态资源 / 首页 / 生命周期
+├── context.py       ★ 统一运行上下文：账号、SQLite Store、IMAP 客户端、
+│                     同步进度与日志、TTL 缓存、微信解密上下文
+├── api_mail.py      邮件路由：目录 / 列表 / 详情 / 附件 / 发信 / 会话 / 分类 / AI 端点
+├── api_wechat.py    微信路由：/api/wechat/*
+├── classify.py      无聊邮件分类（规则引擎）
+├── threads.py       会话归组（并查集）
+├── wechat.py        微信数据访问（只读本机数据库，缓存走 context）
+├── imap_client.py   IMAP 封装（读取 + 删除 + APPEND 已发送）
+├── mailout.py       SMTP 发信
+├── mailparse.py     MIME 解析（GBK 兼容 / cid 内嵌资源）
+├── store.py         SQLite 索引
+└── settings.py      配置与密码读取
+```
+
+- 统一状态在 `app/context.py` 的 `ctx`：`account / store / client / syncing / last_sync / log / 缓存 / wx_app`，
+  两个模块不再各持模块级全局变量；缓存带模块前缀（微信是 `wx:`），可按模块精确失效
+- `GET /api/status` 一次给出两个模块的可用性：`modules.mail`、`modules.wechat`
+- 前端同样只有一个全局 `state`（`state.app` 当前页签、`state.wechat` 微信侧数据、`state.compose` 写信上下文）
+- 微信不可用时（未 init / 微信没开 / 依赖缺失）返回 503，**不影响邮件功能**
+
 ## 微信统计（可选）
 
 WebUI 的「💬 微信」页签读的是本机微信（Weixin.exe）的加密数据库，靠 `wechat-cli` 提取的密钥解密，

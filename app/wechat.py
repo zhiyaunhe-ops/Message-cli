@@ -20,6 +20,9 @@ from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from .context import ctx
+from .context import CACHE_TTL as CACHE_TTL_DEFAULT
+
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE_DIR = ROOT / "source"
 
@@ -32,10 +35,11 @@ TYPE_LABELS = {
 _TABLE_RE = re.compile(r"Msg_[0-9a-f]{32}")
 
 _lock = threading.Lock()
-_app = None            # wechat_cli AppContext（惰性创建，全局一份）
 _mods = None           # 导入的 wechat_cli 子模块集合
-_cache: dict = {}      # key -> (expire_ts, payload)
-CACHE_TTL = 300        # 统计结果缓存 5 分钟
+CACHE_TTL = CACHE_TTL_DEFAULT   # 统计结果缓存 5 分钟（统一上下文里的默认值）
+
+# 缓存统一走 app/context.py，加模块前缀便于按模块失效
+_CACHE_PREFIX = "wx:"
 
 
 class WechatError(RuntimeError):
@@ -91,37 +95,34 @@ def _load_mods():
 
 
 def _app_ctx():
-    """惰性创建全局 AppContext（解密缓存跨请求复用）。"""
-    global _app
-    if _app is not None:
-        return _app
+    """惰性创建微信 AppContext（解密缓存跨请求复用），实例挂在统一上下文里。"""
+    if ctx.wx_app is not None:
+        return ctx.wx_app
     m = _load_mods()
     cfg_path = os.environ.get("WECHAT_CLI_CONFIG") or None
     try:
-        _app = m["AppContext"](cfg_path)
+        app = m["AppContext"](cfg_path)
     except FileNotFoundError as e:
         raise WechatError(
             f"{e}\n先运行（微信需保持登录）: wechat-cli init"
         )
     except Exception as e:
         raise WechatError(f"微信数据初始化失败: {e}")
-    return _app
+    ctx.wx_app = app
+    return app
 
 
 def _cached(key, ttl=CACHE_TTL):
-    item = _cache.get(key)
-    if item and item[0] > time.time():
-        return item[1]
-    return None
+    return ctx.cache_get(_CACHE_PREFIX + str(key))
 
 
 def _put(key, value, ttl=CACHE_TTL):
-    _cache[key] = (time.time() + ttl, value)
-    return value
+    return ctx.cache_put(_CACHE_PREFIX + str(key), value, ttl)
 
 
-def invalidate():
-    _cache.clear()
+def invalidate() -> int:
+    """只清微信的缓存（邮件侧缓存不受影响）。"""
+    return ctx.cache_invalidate(_CACHE_PREFIX)
 
 
 # ---------------------------------------------------------------- 状态

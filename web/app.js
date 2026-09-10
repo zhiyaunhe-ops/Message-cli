@@ -11,6 +11,8 @@
   ];
 
   const state = {
+    app: "mail",            // 当前页签：mail | wechat（统一入口状态）
+    // —— 邮件模块 ——
     folder: "INBOX",
     q: "",
     since: "2026-07-01",
@@ -25,6 +27,10 @@
     showExternal: false,    // 是否显示外链图片（防追踪，默认屏蔽）
     viewMode: "message",    // message | thread
     category: "all",        // all | personal | boring | meeting | automated | promotion
+    // —— 微信模块 ——
+    wechat: { days: 7, data: null, chat: null, row: null },
+    // —— 写邮件 ——
+    compose: { reply: null },   // reply: {folder, uid} 表示这封是回复
   };
 
   const $ = (sel) => document.querySelector(sel);
@@ -842,12 +848,11 @@
   }
 
   /* ------------------------------ 写邮件 / 删除 ------------------------------ */
-  const compose = { reply: null }; // reply = {folder, uid}
 
   function openCompose(prefill) {
     prefill = prefill || {};
-    compose.reply = prefill.reply || null;
-    $("#composeTitle").textContent = compose.reply ? "回复邮件" : "写邮件";
+    state.compose.reply = prefill.reply || null;
+    $("#composeTitle").textContent = state.compose.reply ? "回复邮件" : "写邮件";
     $("#cTo").value = prefill.to || "";
     $("#cCc").value = prefill.cc || "";
     $("#cSubject").value = prefill.subject || "";
@@ -881,9 +886,9 @@
       fd.set("cc", $("#cCc").value.trim());
       fd.set("subject", $("#cSubject").value.trim());
       fd.set("body", $("#cBody").value);
-      if (compose.reply) {
-        fd.set("reply_folder", compose.reply.folder);
-        fd.set("reply_uid", String(compose.reply.uid));
+      if (state.compose.reply) {
+        fd.set("reply_folder", state.compose.reply.folder);
+        fd.set("reply_uid", String(state.compose.reply.uid));
       }
       for (const f of $("#cFiles").files) fd.append("files", f, f.name);
       const r = await api("/api/send", { method: "POST", body: fd });
@@ -968,12 +973,12 @@
       b.addEventListener("click", () => switchApp(b.dataset.app));
     });
     $("#wxRange").addEventListener("change", (e) => {
-      wxState.days = parseInt(e.target.value, 10) || 0;
-      wxState.data = null;
-      wxState.row = null;
+      state.wechat.days = parseInt(e.target.value, 10) || 0;
+      state.wechat.data = null;
+      state.wechat.row = null;
       loadWx(false);
     });
-    $("#wxRefresh").addEventListener("click", () => { wxState.data = null; loadWx(true); });
+    $("#wxRefresh").addEventListener("click", () => { state.wechat.data = null; loadWx(true); });
 
     $("#search").addEventListener("input", (e) => {
       clearTimeout(timer);
@@ -1061,9 +1066,9 @@
   }
 
   /* ------------------------------ 微信统计 ------------------------------ */
-  const wxState = { days: 7, data: null, chat: null, row: null };
 
   function switchApp(name) {
+    state.app = name;
     document.body.dataset.app = name;
     document.querySelectorAll("#appSeg button").forEach((b) =>
       b.classList.toggle("active", b.dataset.app === name)
@@ -1071,7 +1076,7 @@
     $("#mailView").hidden = name !== "mail";
     $("#wxView").hidden = name !== "wechat";
     try { localStorage.setItem("mail.app", name); } catch (e) {}
-    if (name === "wechat" && !wxState.data) loadWx(false);
+    if (name === "wechat" && !state.wechat.data) loadWx(false);
   }
 
   function wxPanel(title, sub) {
@@ -1180,8 +1185,8 @@
   }
 
   async function openWxChat(username, name, row) {
-    if (wxState.row) wxState.row.classList.remove("is-active");
-    wxState.row = row;
+    if (state.wechat.row) state.wechat.row.classList.remove("is-active");
+    state.wechat.row = row;
     row.classList.add("is-active");
     const box = $("#wxDetail");
     box.innerHTML = "";
@@ -1190,7 +1195,7 @@
     head.appendChild(el("span", null, "加载中…"));
     box.appendChild(head);
     try {
-      const d = await api(`/api/wechat/history?chat=${encodeURIComponent(username)}&days=${wxState.days}&limit=60`);
+      const d = await api(`/api/wechat/history?chat=${encodeURIComponent(username)}&days=${state.wechat.days}&limit=60`);
       head.lastChild.textContent = `${d.range} · ${d.total} 条`;
       const msgs = el("div", "wx-msgs");
       d.items.slice().reverse().forEach((m) => {
@@ -1275,13 +1280,13 @@
 
   async function loadWx(refresh) {
     const body = $("#wxBody");
-    if (!wxState.data) body.innerHTML = '<div class="empty">正在扫描本地微信数据库…</div>';
+    if (!state.wechat.data) body.innerHTML = '<div class="empty">正在扫描本地微信数据库…</div>';
     $("#wxMeta").textContent = "扫描中…（首次需解密，约数秒）";
     try {
-      const d = await api(`/api/wechat/overview?days=${wxState.days}${refresh ? "&refresh=1" : ""}`);
-      wxState.data = d;
-      wxState.chat = null;
-      wxState.row = null;
+      const d = await api(`/api/wechat/overview?days=${state.wechat.days}${refresh ? "&refresh=1" : ""}`);
+      state.wechat.data = d;
+      state.wechat.chat = null;
+      state.wechat.row = null;
       const t = new Date(d.generated_at * 1000);
       $("#wxMeta").textContent =
         `${d.range} · ${d.scanned.databases} 库 / ${d.scanned.tables} 张消息表 · ` +

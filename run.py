@@ -116,7 +116,7 @@ def cmd_verify(args):
 
 def cmd_ai(args):
     """离线打印 AI 接口等价输出（不启动服务）。"""
-    from app.main import ai_inbox  # 延迟导入，避免 uvicorn 依赖
+    from app.api_mail import ai_inbox  # 延迟导入，避免 uvicorn 依赖
 
     data = ai_inbox(
         since=args.since,
@@ -129,6 +129,9 @@ def cmd_ai(args):
         offset=0,
         body_chars=args.body_chars,
         include_html=False,
+        include_inline=False,
+        category=args.category,
+        boring=args.boring,
         order="desc",
     )
     print(json.dumps(data, ensure_ascii=False, indent=2))
@@ -222,6 +225,9 @@ def main():
     a.add_argument("--q", default=None)
     a.add_argument("--limit", type=int, default=20)
     a.add_argument("--body-chars", type=int, default=4000)
+    a.add_argument("--category", default=None,
+                   choices=["personal", "meeting", "automated", "promotion"], help="只看某一类")
+    a.add_argument("--boring", default=None, action="store_true", help="只看无聊邮件（会议/系统/推广）")
     a.set_defaults(func=cmd_ai)
 
     w = sub.add_parser("wechat", help="微信消息统计（复用 wechat-cli 解密内核）")

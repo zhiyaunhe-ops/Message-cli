@@ -85,5 +85,20 @@
 
     curl "http://127.0.0.1:8765/api/ai/threads?since=2026-07-01&only_grouped=true&limit=30"
 
+## 微信统计（同一服务的另一半）
+
+邮件与微信跑在**同一个进程、同一个端口**里，共享一份运行上下文（账号 / 缓存 / 日志）。
+WebUI 顶栏可切换「✉ 信箱 / 💬 微信」；微信侧只读本机数据库，依赖缺失时返回 503，不影响邮件。
+
+- GET  /api/wechat/status                可用性自检（密钥 / 数据目录 / 引用方式）
+- GET  /api/wechat/overview?days=7       全局统计：消息量 / 类型 / 活跃会话 / 发言排行（?refresh=1 跳过缓存）
+- GET  /api/wechat/sessions?limit=30     最近会话列表
+- GET  /api/wechat/history?chat=名字&days=7&limit=50    单个会话最近消息
+- GET  /api/wechat/stats?chat=名字&days=7               单个会话统计（类型 / 排行 / 24 小时）
+
+一次看清两个模块的状态：
+
+    curl "http://127.0.0.1:8765/api/status"     # modules.mail / modules.wechat 各自可用性
+
 Web 界面：http://127.0.0.1:8765/  （支持 5 套主题：宣纸水墨 / 瑞士极简 / 暗夜霓虹 / 复古终端 / 琉璃柔彩；
 列表头可切换「邮件 / 会话」两种视图，并按分类筛选）
