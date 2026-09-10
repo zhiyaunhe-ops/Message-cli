@@ -241,7 +241,7 @@
       li.appendChild(el("span", "folder-count", f.unread ? `${f.total} · ${f.unread} 未读` : String(f.total)));
       li.addEventListener("click", () => selectFolder(f.name));
       // 系统目录（收件箱 / 已发送 / 草稿 / 回收站）后端不允许删，这里也不渲染按钮
-      if (!PROTECTED_FOLDERS.has(f.name)) {
+      if (!protectedFolders().has(f.name)) {
         const del = el("button", "folder-del", "×");
         del.type = "button";
         del.title = `删除目录「${f.name}」`;
@@ -255,8 +255,14 @@
     });
   }
 
-  /** 与前端的发信流程耦合的系统目录：和后端 /api/folders 的保护名单保持一致。 */
-  const PROTECTED_FOLDERS = new Set(["INBOX", "Sent Items", "Drafts", "Trash", "已发送", "草稿箱", "已删除"]);
+  /** 系统目录：不给删除按钮。与后端 `/api/folders` 的 _protected_folders() 同源 ——
+      INBOX + 当前账号 aliases 里的 sent/drafts/trash。按账号动态算，换服务商
+      （目录名可能是 "Sent"、"[Gmail]/Sent Mail" 等）也不会误给一个点了必报 400 的按钮。 */
+  function protectedFolders() {
+    const a = activeAccountInfo();
+    const al = (a && a.aliases) || {};
+    return new Set(["INBOX", al.inbox, al.sent, al.drafts, al.trash].filter(Boolean));
+  }
 
   async function deleteFolder(f) {
     if (!confirm(
@@ -1600,6 +1606,8 @@
       state.activeAccount = r.active || "";
       state.accountsFile = r.file || "";
       paintAccountLabel();
+      // 目录的「系统目录不给删按钮」是按账号 aliases 算的，账号回来后要重画一遍
+      if (state.folders.length) renderFolders();
     } catch (e) {
       state.accounts = [];
     }
