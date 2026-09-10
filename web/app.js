@@ -713,24 +713,28 @@
       const meta = CAT_META[t.category] || { emoji: "❓", label: t.category_label };
       bar.appendChild(el("span", "cat-badge " + (CAT_META[t.category] ? CAT_META[t.category].cls : ""), `${meta.emoji} ${meta.label} · 无聊邮件`));
     }
+    const last = (t.messages || [])[t.messages.length - 1];
     const backBtn = el("button", "btn", "在邮件视图打开最新一封");
+    backBtn.disabled = !last;
     backBtn.onclick = () => {
+      if (!last) return;
       state.viewMode = "message";
       document.querySelectorAll("#viewSeg button").forEach((b) => b.classList.toggle("active", b.dataset.view === "message"));
       loadMessages(false).then(() => {
-        const last = t.messages[t.messages.length - 1];
         const row = document.querySelector(`.msg-row[data-uid="${last.uid}"]`);
         openMessage(last.folder, last.uid, row);
       });
     };
-    const lastIn = [...t.messages].reverse().find((m) => !m.mine) || t.messages[t.messages.length - 1];
-    const replyBtn = el("button", "btn", "↩ 回复");
-    replyBtn.onclick = () => openCompose({
-      to: replyTargetOf(lastIn),
-      subject: /^re:/i.test(t.subject || "") ? t.subject : "Re: " + (t.subject || ""),
-      reply: { folder: lastIn.folder, uid: lastIn.uid },
-    });
-    bar.insertBefore(replyBtn, backBtn);
+    const lastIn = [...(t.messages || [])].reverse().find((m) => !m.mine) || last;
+    if (lastIn) {
+      const replyBtn = el("button", "btn", "↩ 回复");
+      replyBtn.onclick = () => openCompose({
+        to: replyTargetOf(lastIn),
+        subject: /^re:/i.test(t.subject || "") ? t.subject : "Re: " + (t.subject || ""),
+        reply: { folder: lastIn.folder, uid: lastIn.uid },
+      });
+      bar.appendChild(replyBtn);
+    }
     bar.appendChild(backBtn);
     reader.appendChild(bar);
 
