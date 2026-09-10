@@ -149,6 +149,21 @@ Sent Items   17 封   正文 17   附件 29   日期 2026-07-08 → 2026-09-09
 
 与 IMAP `SINCE 01-Jul-2026` 实测计数（133 / 17 / 1）完全吻合。
 
+## Windows 静默启动与托盘（可选）
+
+`scripts/` 下提供了无窗口启动与托盘管理，不依赖任何第三方模块：
+
+| 脚本 | 作用 |
+| --- | --- |
+| `start-server.ps1` | 隐藏窗口起服务（日志写 `data/server.log`），等端口就绪后自动开浏览器 |
+| `MailTray.ps1` | 托盘图标（WinForms），菜单：打开 / 立即同步 / 重启 / 停止 / 查看日志 / 退出；Global Mutex 保证单例 |
+| `MailWebUI.vbs` | 零闪窗拉起托盘（`wscript` 隐藏执行），适合做桌面快捷方式的目标 |
+| `MailWebUI.bat` | 同上，直接运行版 |
+
+脚本按以下顺序解析 Python 解释器：`$env:MAILUI_PYTHON` → `scripts\python.local.txt`
+→ 项目内 `.venv` → PATH 上的 `python`。把你的解释器路径写进 `scripts\python.local.txt`
+（参考 `python.local.example.txt`）即可，该文件已 gitignore。
+
 ## 目录结构
 
 ```

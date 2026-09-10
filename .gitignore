@@ -58,3 +58,6 @@ Thumbs.db
 # 本地开发上下文（AI 助手的项目记忆与工作日志，含私人信息）
 # ============================================================
 .workbuddy/
+
+# 本机 Python 解释器路径（含本机用户名，用 python.local.example.txt 代替）
+scripts/python.local.txt
