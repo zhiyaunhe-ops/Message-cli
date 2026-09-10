@@ -28,7 +28,11 @@
     viewMode: "message",    // message | thread
     category: "all",        // all | personal | boring | meeting | automated | promotion
     // —— 微信模块 ——
-    wechat: { days: 7, data: null, chat: null, row: null },
+    // hideOfficial: 过滤公众号/系统通知；cat: 分类筛选；kwMine: 词云口径
+    wechat: {
+      days: 7, data: null, chat: null, row: null,
+      hideOfficial: true, cat: "all", kwMine: "all", fold: 3,
+    },
     // —— 写邮件 ——
     compose: { reply: null },   // reply: {folder, uid} 表示这封是回复
   };
@@ -1018,9 +1022,20 @@
       state.wechat.days = parseInt(e.target.value, 10) || 0;
       state.wechat.data = null;
       state.wechat.row = null;
+      state.wechat.cat = "all";
       loadWx(false);
     });
     $("#wxRefresh").addEventListener("click", () => { state.wechat.data = null; loadWx(true); });
+
+    // 公众号开关：整个微信页签（统计 / 会话 / 最新消息 / 词云）一起生效
+    $("#wxOfficial").addEventListener("click", () => {
+      state.wechat.hideOfficial = !state.wechat.hideOfficial;
+      state.wechat.cat = "all";
+      try { localStorage.setItem("mail.wx.hideOfficial", state.wechat.hideOfficial ? "1" : "0"); } catch (e) {}
+      paintOfficialBtn();
+      state.wechat.data = null;
+      loadWx(false);
+    });
 
     $("#search").addEventListener("input", (e) => {
       clearTimeout(timer);
@@ -1138,6 +1153,124 @@
     return c;
   }
 
+  /* 公众号开关的按钮状态 */
+  function paintOfficialBtn() {
+    const b = $("#wxOfficial");
+    if (!b) return;
+    const on = state.wechat.hideOfficial;
+    b.classList.toggle("btn-primary", on);
+    b.textContent = on ? "已隐藏公众号" : "隐藏公众号";
+    b.title = on
+      ? "当前已过滤公众号 / 系统通知，点击恢复显示"
+      : "点击过滤公众号与系统通知（微信团队 / 文件传输助手 / 订阅号入口）";
+  }
+
+  /* 微信侧所有请求共用的筛选参数：时间窗 + 公众号开关 + 分类 */
+  function wxQuery(extra) {
+    const w = state.wechat;
+    const p = new URLSearchParams({ days: String(w.days) });
+    if (w.hideOfficial) p.set("exclude_official", "1");
+    if (w.cat && w.cat !== "all") p.set("category", w.cat);
+    Object.entries(extra || {}).forEach(([k, v]) => p.set(k, String(v)));
+    return p.toString();
+  }
+
+  /* 分类标签（项/同/群/企/私/号/统），颜色由 CSS 按 data-cat 区分 */
+  function wxTag(item) {
+    const t = el("i", null, item.tag || (item.is_group ? "群" : "私"));
+    if (item.category) {
+      t.dataset.cat = item.category;
+      t.title = item.cat_label + (item.project ? " · " + item.project : "");
+    }
+    return t;
+  }
+
+  function wxCatChip(label, count, title, active) {
+    const c = el("button", "wx-chip" + (active ? " is-on" : ""));
+    c.appendChild(el("span", "l", label));
+    if (count != null) c.appendChild(el("span", "n", String(count)));
+    if (title) c.title = title;
+    return c;
+  }
+
+  /* 分类筛选条：全部 / 项目群 / 同事 / … + 项目维度概览 */
+  function renderWxCats(d) {
+    const box = $("#wxCats");
+    if (!box) return;
+    box.hidden = false;
+    box.innerHTML = "";
+
+    const pick = (id) => {
+      state.wechat.cat = state.wechat.cat === id ? "all" : id;
+      renderWxCats(state.wechat.data);
+      applyWxFilter();
+    };
+
+    const all = wxCatChip("全部", d.total, "不按分类筛选", state.wechat.cat === "all");
+    all.addEventListener("click", () => { state.wechat.cat = "all"; renderWxCats(d); applyWxFilter(); });
+    box.appendChild(all);
+
+    (d.by_category || []).forEach((c) => {
+      const chip = wxCatChip(
+        c.label, c.count,
+        `${c.label}：${c.chats} 个会话 · ${c.count} 条 · 占 ${c.pct}%`,
+        state.wechat.cat === c.category
+      );
+      chip.dataset.cat = c.category;
+      chip.addEventListener("click", () => pick(c.category));
+      box.appendChild(chip);
+    });
+
+    if ((d.by_project || []).length) {
+      box.appendChild(el("span", "wx-chip-sep", "项目"));
+      d.by_project.slice(0, 6).forEach((p) => {
+        const chip = wxCatChip(p.project, p.count,
+          `${p.project}：项目群消息 ${p.count} 条（占全部 ${p.pct}%）`, false);
+        chip.classList.add("is-static");
+        chip.dataset.cat = "project";
+        box.appendChild(chip);
+      });
+    }
+
+    if (state.wechat.hideOfficial && d.skipped_official_chats) {
+      box.appendChild(el("span", "wx-chip-note",
+        `已过滤 ${d.skipped_official_chats} 个公众号 / 系统会话`));
+    }
+  }
+
+  function wxFilteredChats(d) {
+    const cat = state.wechat.cat;
+    const list = (d && d.top_chats) || [];
+    return cat === "all" ? list : list.filter((c) => c.category === cat);
+  }
+
+  /* 切换分类后：Top 列表本地过滤，最新消息 / 词云 / 会话列表按新条件重取 */
+  function applyWxFilter() {
+    paintWxTopChats();
+    const rbox = $("#wxRecent");
+    if (rbox) loadWxRecent($("#wxRecentSub"), rbox);
+    if ($("#wxCloud")) loadWxCloud();
+    paintWxSessions();
+  }
+
+  function paintWxTopChats() {
+    const box = $("#wxTopChats");
+    if (!box || !state.wechat.data) return;
+    const list = wxFilteredChats(state.wechat.data);
+    const sub = $("#wxTopSub");
+    if (sub) {
+      sub.textContent = state.wechat.cat === "all"
+        ? `共 ${state.wechat.data.chats} 个（点击看最近消息）`
+        : `${list.length} 个 · 已按分类筛选`;
+    }
+    box.innerHTML = "";
+    if (!list.length) {
+      box.appendChild(el("div", "wx-last", "该分类下没有会话"));
+      return;
+    }
+    box.appendChild(wxChatRows(list, 25));
+  }
+
   const BAR_MAX_PX = 96;
   function wxBars(entries) {
     const wrap = el("div", "wx-bars");
@@ -1189,9 +1322,10 @@
       const row = el("div", "wx-row");
       row.appendChild(el("div", "rk", String(i + 1)));
       const nm = el("div", "nm");
-      nm.appendChild(el("i", null, c.is_group ? "群" : "私"));
+      nm.appendChild(wxTag(c));
       nm.appendChild(document.createTextNode(c.chat));
-      nm.title = c.chat;
+      nm.title = `${c.chat} · ${c.cat_label || (c.is_group ? "群聊" : "单聊")}` +
+        (c.project ? " · " + c.project : "");
       row.appendChild(nm);
       row.appendChild(el("div", "ct", String(c.count)));
       const bar = el("div", "bar");
@@ -1212,9 +1346,9 @@
       row.appendChild(el("div", "rk", s.time.slice(0, 5)));
       const nm = el("div", "nm");
       if (s.unread > 0) nm.appendChild(el("span", "wx-dot"));
-      nm.appendChild(el("i", null, s.is_group ? "群" : "私"));
+      nm.appendChild(wxTag(s));
       nm.appendChild(document.createTextNode(s.chat));
-      nm.title = s.chat;
+      nm.title = `${s.chat} · ${s.cat_label || ""}`;
       row.appendChild(nm);
       row.appendChild(el("div", "ct", s.unread ? `${s.unread} 未读` : ""));
       const last = el("div", "wx-last");
@@ -1224,6 +1358,53 @@
       wrap.appendChild(row);
     });
     return wrap;
+  }
+
+  function wxMsgLine(m) {
+    const line = el("div", "wx-msg");
+    line.appendChild(el("div", "t", m.time));
+    const b = el("div", "b");
+    if (m.sender) b.appendChild(el("u", null, m.sender));
+    const txt = m.text || `(${m.type})`;
+    b.appendChild(m.text ? document.createTextNode(txt) : el("em", null, txt));
+    line.appendChild(b);
+    return line;
+  }
+
+  /* 折叠外壳：一个按钮 + 一段默认隐藏的内容 */
+  function wxFoldBlock(label, rows) {
+    const wrap = el("div", "wx-fold");
+    const hold = el("div", "wx-fold-box");
+    hold.hidden = true;
+    rows.forEach((r) => hold.appendChild(r));
+    const open = `⋯ 展开 ${label} 其余 ${rows.length} 条`;
+    const close = `收起 ${label} 的 ${rows.length} 条`;
+    const btn = el("button", "wx-fold-btn", open);
+    btn.addEventListener("click", () => {
+      hold.hidden = !hold.hidden;
+      btn.textContent = hold.hidden ? open : close;
+      btn.classList.toggle("is-open", !hold.hidden);
+    });
+    wrap.appendChild(btn);
+    wrap.appendChild(hold);
+    return wrap;
+  }
+
+  /* 会话详情：同一个人连续发言超过 N 条时，前 N 条照常显示，其余折叠 */
+  function renderWxRuns(list, box) {
+    const keep = state.wechat.fold;
+    let i = 0;
+    while (i < list.length) {
+      const who = list[i].sender || "";
+      let j = i;
+      while (j < list.length && (list[j].sender || "") === who) j++;
+      const run = list.slice(i, j);
+      run.slice(0, keep).forEach((m) => box.appendChild(wxMsgLine(m)));
+      if (run.length > keep) {
+        box.appendChild(wxFoldBlock(who || "我", run.slice(keep).map(wxMsgLine)));
+      }
+      i = j;
+    }
   }
 
   async function openWxChat(username, name, row) {
@@ -1240,16 +1421,7 @@
       const d = await api(`/api/wechat/history?chat=${encodeURIComponent(username)}&days=${state.wechat.days}&limit=60`);
       head.lastChild.textContent = `${d.range} · ${d.total} 条`;
       const msgs = el("div", "wx-msgs");
-      d.items.slice().reverse().forEach((m) => {
-        const line = el("div", "wx-msg");
-        line.appendChild(el("div", "t", m.time));
-        const b = el("div", "b");
-        if (m.sender) b.appendChild(el("u", null, m.sender));
-        const txt = m.text || `(${m.type})`;
-        b.appendChild(m.text ? document.createTextNode(txt) : el("em", null, txt));
-        line.appendChild(b);
-        msgs.appendChild(line);
-      });
+      renderWxRuns(d.items.slice().reverse(), msgs);
       box.appendChild(msgs);
     } catch (e) {
       head.lastChild.textContent = "加载失败：" + e.message;
@@ -1263,10 +1435,27 @@
     const cards = el("div", "wx-cards");
     cards.appendChild(wxCard("消息总数", d.total, `我发 ${d.mine} · 收到 ${d.others}`));
     cards.appendChild(wxCard("活跃会话", d.chats, `群 ${d.group_chats} · 单聊 ${d.private_chats}`));
-    cards.appendChild(wxCard("群聊消息", d.group_messages,
-      d.total ? `占 ${Math.round((d.group_messages / d.total) * 100)}%` : "—"));
+    const proj = (d.by_category || []).find((c) => c.category === "project");
+    const colleague = (d.by_category || []).find((c) => c.category === "colleague");
+    cards.appendChild(wxCard("项目群消息", proj ? proj.count : 0,
+      (d.by_project || []).length
+        ? d.by_project.slice(0, 2).map((p) => `${p.project} ${p.count}`).join(" · ")
+        : "群名以 # 开头"));
+    cards.appendChild(wxCard("同事消息", colleague ? colleague.count : 0,
+      colleague ? `${colleague.chats} 位（YY- / YYHK-）` : "YY- / YYHK- 备注"));
     cards.appendChild(wxCard("当前未读", d.unread, "全部会话合计"));
     body.appendChild(cards);
+
+    // 关键词词云：整宽，最显眼的位置
+    const pCloud = wxPanel("关键词词云", "加载中…");
+    pCloud.classList.add("wx-cloud-panel");
+    pCloud.querySelector("h3 .sub").id = "wxCloudSub";
+    pCloud.appendChild(wxCloudControls());
+    const cloud = el("div", "wx-cloud");
+    cloud.id = "wxCloud";
+    pCloud.appendChild(cloud);
+    body.appendChild(pCloud);
+    loadWxCloud();
 
     const grid = el("div", "wx-grid");
     const left = el("div");
@@ -1285,76 +1474,183 @@
     pHour.appendChild(wxBars(Object.entries(d.by_hour).map(([h, v]) => [h + "时", v])));
     left.appendChild(pHour);
 
-    // 左下空白区：跨会话最新消息流
+    // 左下空白区：跨会话最新消息流（同一会话超过 N 条自动折叠）
     const pRecent = wxPanel("最新消息", "加载中…");
+    pRecent.querySelector("h3 .sub").id = "wxRecentSub";
     const recentBox = el("div", "wx-rows wx-recent");
+    recentBox.id = "wxRecent";
     recentBox.appendChild(el("div", "wx-last", "加载中…"));
     pRecent.appendChild(recentBox);
     left.appendChild(pRecent);
-    loadWxRecent(pRecent.querySelector("h3 .sub"), recentBox);
+    loadWxRecent($("#wxRecentSub") || pRecent.querySelector("h3 .sub"), recentBox);
 
     const pType = wxPanel("消息类型", d.by_type.length + " 类");
     pType.appendChild(wxTypes(d.by_type));
     right.appendChild(pType);
 
     const pTop = wxPanel("活跃会话 Top", `共 ${d.chats} 个（点击查看最近消息）`);
-    pTop.appendChild(wxChatRows(d.top_chats, 25));
+    pTop.querySelector("h3 .sub").id = "wxTopSub";
+    const topBox = el("div");
+    topBox.id = "wxTopChats";
+    pTop.appendChild(topBox);
     right.appendChild(pTop);
 
     grid.appendChild(left);
     grid.appendChild(right);
     body.appendChild(grid);
+    paintWxTopChats();
+  }
+
+  function wxCloudControls() {
+    const seg = el("div", "seg wx-seg");
+    [["all", "全部"], ["others", "别人说的"], ["me", "我说的"]].forEach(([v, lb]) => {
+      const b = el("button", state.wechat.kwMine === v ? "active" : null, lb);
+      b.addEventListener("click", () => {
+        if (state.wechat.kwMine === v) return;
+        state.wechat.kwMine = v;
+        [...seg.children].forEach((x) => x.classList.toggle("active", x === b));
+        loadWxCloud();
+      });
+      seg.appendChild(b);
+    });
+    return seg;
+  }
+
+  async function loadWxCloud() {
+    const box = $("#wxCloud");
+    if (!box) return;
+    const sub = $("#wxCloudSub");
+    box.innerHTML = '<div class="wx-last">分词统计中…</div>';
+    try {
+      const r = await api(`/api/wechat/keywords?${wxQuery({ limit: 90, mine: state.wechat.kwMine })}`);
+      if (sub) {
+        sub.textContent = `${r.messages} 条文本 · ${r.chats} 个会话` +
+          (r.per_chat_cap && r.per_chat_cap < 800 ? ` · 每会话取最近 ${r.per_chat_cap} 条` : "") +
+          (r.truncated ? " · 已截断" : "") + (r.engine === "jieba" ? "" : " · 二元组分词");
+      }
+      box.innerHTML = "";
+      if (!r.words.length) {
+        box.appendChild(el("div", "wx-last", "该范围内没有可统计的文本消息"));
+        return;
+      }
+      r.words.forEach((w) => {
+        const s = el("span", "wx-word", w.word);
+        s.style.fontSize = (11 + w.weight * 2.1).toFixed(1) + "px";
+        s.style.opacity = (0.55 + w.weight * 0.045).toFixed(2);
+        if (w.weight >= 8) s.classList.add("is-hot");
+        else if (w.weight >= 5) s.classList.add("is-warm");
+        s.title = `${w.word} · ${w.count} 条消息提到`;
+        box.appendChild(s);
+      });
+    } catch (e) {
+      if (sub) sub.textContent = "";
+      box.innerHTML = '<div class="wx-last">词云加载失败：' + esc(e.message) + "</div>";
+    }
+  }
+
+  function wxRecentRow(m) {
+    const row = el("div", "wx-row is-recent");
+    if (m.mine) row.classList.add("is-mine");
+    row.appendChild(el("div", "rk", m.time));
+    const nm = el("div", "nm");
+    nm.appendChild(wxTag(m));
+    nm.appendChild(document.createTextNode(m.chat));
+    nm.title = `${m.chat} · ${m.cat_label || ""}` + (m.sender && !m.mine ? " · " + m.sender : "");
+    row.appendChild(nm);
+    row.appendChild(el("div", "ct", m.mine ? "我 ↗" : (m.sender || "")));
+    const last = el("div", "wx-last");
+    last.style.gridColumn = "2 / -1";
+    last.textContent = m.text || `(${m.type})`;
+    row.appendChild(last);
+    row.addEventListener("click", () => openWxChat(m.username, m.chat, row));
+    return row;
+  }
+
+  /* 最新消息流：同一个会话最多显示前 N 条，其余折叠，避免话多的人刷屏 */
+  function renderWxRecent(items, box) {
+    const keep = state.wechat.fold;
+    const groups = new Map();
+    items.forEach((m) => {
+      let g = groups.get(m.username);
+      if (!g) {
+        g = { shown: 0, extra: [], slot: null, chat: m.chat };
+        groups.set(m.username, g);
+      }
+      const row = wxRecentRow(m);
+      if (g.shown < keep) {
+        box.appendChild(row);
+        g.shown++;
+        if (g.shown === keep) {
+          g.slot = el("div", "wx-fold-slot");
+          box.appendChild(g.slot);
+        }
+      } else {
+        g.extra.push(row);
+      }
+    });
+    let folded = 0;
+    groups.forEach((g) => {
+      if (!g.slot) return;
+      if (!g.extra.length) { g.slot.remove(); return; }
+      folded += g.extra.length;
+      g.slot.appendChild(wxFoldBlock(g.chat, g.extra));
+    });
+    return { chats: groups.size, folded };
   }
 
   async function loadWxRecent(subEl, box) {
     try {
-      const r = await api(`/api/wechat/recent?days=${state.wechat.days}&limit=20`);
-      if (subEl) subEl.textContent = r.range + " · 点击行看会话";
+      const r = await api(`/api/wechat/recent?${wxQuery({ limit: 120 })}`);
       box.innerHTML = "";
       if (!r.items.length) {
-        box.appendChild(el("div", "wx-last", "该时间窗内没有消息"));
+        if (subEl) subEl.textContent = r.range;
+        box.appendChild(el("div", "wx-last", "该范围内没有消息"));
         return;
       }
-      r.items.forEach((m) => {
-        const row = el("div", "wx-row is-recent");
-        if (m.mine) row.classList.add("is-mine");
-        row.appendChild(el("div", "rk", m.time));
-        const nm = el("div", "nm");
-        nm.appendChild(el("i", null, m.is_group ? "群" : "私"));
-        nm.appendChild(document.createTextNode(m.chat));
-        nm.title = m.chat + (m.sender && !m.mine ? " · " + m.sender : "");
-        row.appendChild(nm);
-        row.appendChild(el("div", "ct", m.mine ? "我 ↗" : (m.sender || "")));
-        const last = el("div", "wx-last");
-        last.style.gridColumn = "2 / -1";
-        last.textContent = m.text || `(${m.type})`;
-        row.appendChild(last);
-        row.addEventListener("click", () => openWxChat(m.username, m.chat, row));
-        box.appendChild(row);
-      });
+      const st = renderWxRecent(r.items, box);
+      if (subEl) {
+        subEl.textContent = `${r.range} · ${st.chats} 个会话` +
+          (st.folded ? ` · 折叠 ${st.folded} 条` : "");
+      }
     } catch (e) {
       if (subEl) subEl.textContent = "";
       box.innerHTML = '<div class="wx-last">加载失败：' + esc(e.message) + "</div>";
     }
   }
 
+  /* 会话列表已在本地，切分类时只做客户端过滤，不再打服务端 */
+  function paintWxSessions() {
+    const panel = $("#wxSessions");
+    if (!panel) return;
+    const all = state.wechat.sessions || [];
+    const cat = state.wechat.cat;
+    const items = cat === "all" ? all : all.filter((s) => s.category === cat);
+    panel.innerHTML = "";
+    const h = el("h3");
+    h.appendChild(el("span", null, "最近会话"));
+    h.appendChild(el("span", "sub",
+      `${items.length} 条 · 按最后一条消息时间排序` +
+      (cat === "all" ? "" : "（已按分类筛选）")));
+    panel.appendChild(h);
+    panel.appendChild(items.length
+      ? wxSessionRows(items)
+      : el("div", "wx-last", "该分类下没有最近会话"));
+  }
+
   async function loadWxSessions() {
     const body = $("#wxBody");
     let panel = $("#wxSessions");
     if (!panel) {
-      panel = wxPanel("最近会话", "按最后一条消息时间排序");
+      panel = wxPanel("最近会话", "加载中…");
       panel.id = "wxSessions";
       body.appendChild(panel);
-      panel.appendChild(el("div", "empty", "加载中…"));
     }
     try {
-      const r = await api("/api/wechat/sessions?limit=30");
-      panel.innerHTML = "";
-      const h = el("h3");
-      h.appendChild(el("span", null, "最近会话"));
-      h.appendChild(el("span", "sub", "按最后一条消息时间排序"));
-      panel.appendChild(h);
-      panel.appendChild(wxSessionRows(r.items));
+      const p = new URLSearchParams({ limit: "40" });
+      if (state.wechat.hideOfficial) p.set("exclude_official", "1");
+      const r = await api(`/api/wechat/sessions?${p}`);
+      state.wechat.sessions = r.items || [];
+      paintWxSessions();
     } catch (e) {
       panel.innerHTML = '<div class="empty">会话列表加载失败</div>';
     }
@@ -1365,7 +1661,11 @@
     if (!state.wechat.data) body.innerHTML = '<div class="empty">正在扫描本地微信数据库…</div>';
     $("#wxMeta").textContent = "扫描中…（首次需解密，约数秒）";
     try {
-      const d = await api(`/api/wechat/overview?days=${state.wechat.days}${refresh ? "&refresh=1" : ""}`);
+      // 概览必须扫全部分类（分类筛选条的计数从它来），所以不带 category
+      const p = new URLSearchParams({ days: String(state.wechat.days) });
+      if (state.wechat.hideOfficial) p.set("exclude_official", "1");
+      if (refresh) p.set("refresh", "1");
+      const d = await api(`/api/wechat/overview?${p}`);
       state.wechat.data = d;
       state.wechat.chat = null;
       state.wechat.row = null;
@@ -1373,6 +1673,7 @@
       $("#wxMeta").textContent =
         `${d.range} · ${d.scanned.databases} 库 / ${d.scanned.tables} 张消息表 · ` +
         `${String(t.getHours()).padStart(2, "0")}:${String(t.getMinutes()).padStart(2, "0")} 更新`;
+      renderWxCats(d);
       renderWx(d);
       const detail = el("div", "wx-panel wx-detail");
       detail.id = "wxDetail";
@@ -1383,6 +1684,7 @@
         `<div class="empty">微信数据不可用：${esc(e.message)}<br><br>` +
         "需先运行 <b>wechat-cli init</b>（微信保持登录），并确保 mailui 环境装了 pycryptodome / zstandard</div>";
       $("#wxMeta").textContent = "";
+      $("#wxCats").hidden = true;
     }
   }
 
@@ -1396,6 +1698,13 @@
 
     bind();
     loadStatus();
+
+    // 微信侧偏好：公众号过滤默认开（这类推送基本是噪音），可手动关掉并记住
+    try {
+      const v = localStorage.getItem("mail.wx.hideOfficial");
+      if (v !== null) state.wechat.hideOfficial = v === "1";
+    } catch (e) {}
+    paintOfficialBtn();
 
     // 恢复上次停留的页签（信箱 / 微信），可用 ?app=wechat 强制指定
     let app0 = "mail";

@@ -147,13 +147,33 @@ def cmd_wechat(args):
         print("提示：微信需保持登录，然后运行 wechat-cli init")
         return 1
 
+    hide = bool(getattr(args, "no_official", False))
+    cat = getattr(args, "category", None)
+
     if args.chat:
         data = wx.chat_history(args.chat, days=args.days or None, limit=args.limit)
+    elif getattr(args, "keywords", False):
+        data = wx.keywords(days=args.days or None, limit=args.limit,
+                           exclude_official=hide or True, category=cat)
     else:
-        data = wx.overview(days=args.days or None)
+        data = wx.overview(days=args.days or None, exclude_official=hide)
 
     if args.json:
         print(json.dumps(data, ensure_ascii=False, indent=2))
+        return 0
+
+    if getattr(args, "keywords", False) and not args.chat:
+        print(f"\n关键词词云 · {data['range']}"
+              f"（{data['messages']} 条文本 / {data['chats']} 个会话 / {data['engine']} 分词）")
+        if cat:
+            print(f"  只看分类: {cat}")
+        if not data["words"]:
+            print("  没有可统计的文本消息")
+            return 0
+        peak = data["words"][0]["count"] or 1
+        for w in data["words"]:
+            bar = "█" * max(1, int(w["count"] / peak * 30))
+            print(f"    {w['word'][:16]:<16} |{bar} {w['count']}")
         return 0
 
     if args.chat:
@@ -163,7 +183,8 @@ def cmd_wechat(args):
             print(f"  [{it['time']}] {who}{it['text']}")
         return 0
 
-    print(f"\n微信统计 · 最近 {args.days} 天（{data['range']}）")
+    print(f"\n微信统计 · 最近 {args.days} 天（{data['range']}）"
+          + (f" · 已过滤 {data['skipped_official_chats']} 个公众号/系统会话" if hide else ""))
     print(f"  消息总数   {data['total']}   （我发 {data['mine']} / 收到 {data['others']}）")
     print(f"  活跃会话   {data['chats']} 个（群 {data['group_chats']} / 单聊 {data['private_chats']}）")
     print(f"  群聊消息   {data['group_messages']}   单聊消息 {data['private_messages']}")
@@ -179,10 +200,18 @@ def cmd_wechat(args):
     for t in data["by_type"][:8]:
         print(f"    {t['type']:<10} {t['count']:>6}  {t['pct']}%")
 
+    print("\n  会话分类:")
+    for c in data.get("by_category", []):
+        print(f"    [{c['tag']}] {c['label']:<6} {c['count']:>6} 条 / {c['chats']:>3} 个会话  {c['pct']}%")
+    if data.get("by_project"):
+        print("\n  项目群（群名 # 开头）:")
+        for p in data["by_project"]:
+            print(f"    {p['project'][:20]:<20} {p['count']:>6} 条  {p['pct']}%")
+
     print("\n  活跃会话 Top 15:")
     for c in data["top_chats"][:15]:
-        tag = "群" if c["is_group"] else "私"
-        print(f"    [{tag}] {c['chat'][:34]:<34} {c['count']:>6}  {c['pct']}%")
+        print(f"    [{c.get('tag') or ('群' if c['is_group'] else '私')}] "
+              f"{c['chat'][:34]:<34} {c['count']:>6}  {c['pct']}%")
 
     print("\n  24 小时分布:")
     peak_h = max(data["by_hour"].values()) if data["by_hour"] else 0
@@ -234,6 +263,11 @@ def main():
     w.add_argument("--days", type=int, default=7, help="最近 N 个自然日；0 表示全部时间")
     w.add_argument("--chat", default=None, help="指定会话名，输出该会话最近消息")
     w.add_argument("--limit", type=int, default=50)
+    w.add_argument("--no-official", action="store_true",
+                   help="过滤公众号 / 系统通知")
+    w.add_argument("--keywords", action="store_true", help="输出关键词词云")
+    w.add_argument("--category", default=None,
+                   help="只看某类会话：project/colleague/group/wecom/private/official/system")
     w.add_argument("--json", action="store_true")
     w.set_defaults(func=cmd_wechat)
 

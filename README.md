@@ -6,6 +6,9 @@
 - **无聊邮件分类**：本地规则引擎自动打标（📅 会议/日程、🤖 系统自动、📢 营销推广），列表徽章显示、可一键「只看人工」
 - **写邮件 / 回复 / 删除**：顶栏「✏ 写邮件」（SMTP，支持多附件）；阅读器与会话气泡可「↩ 回复」（自动带引用）和「🗑 删除」（COPY 到服务器回收站）
 - **微信统计页签**：顶栏「💬 微信」切换到本地微信数据看板（消息总量 / 每日趋势 / 24 小时分布 / 类型分布 / 活跃会话排行 / 最近会话），点会话看最近消息
+- **微信会话分类**：按命名习惯自动分类——`#xxx` 群 → 项目群（并抽出项目名）、备注 `YY-` / `YYHK-` → 同事、`gh_` → 公众号、`@openim` → 企业微信；顶栏「隐藏公众号」一键过滤公众号/系统通知，分类筛选条可只看某一类
+- **微信关键词词云**：时间窗内文本消息分词统计（jieba，按「同一条消息同词只算一次」计权），可切「全部 / 别人说的 / 我说的」
+- **刷屏折叠**：最新消息流里同一会话只展示最近 3 条，其余折叠；会话详情里同一人连续发言超过 3 条也折叠
 - **REST API**：完整的 JSON 接口；自动生成 OpenAPI 文档（`/docs`）
 - **AI 友好端点**：结构化 JSON、自动截断正文、含 `attachments` 直链；详见 `/llms.txt` 与 `/api/ai/schema`
 
@@ -60,12 +63,31 @@ wechat-cli init
 # 2. 运行服务的 Python 环境需要有 pycryptodome / zstandard
 pip install pycryptodome zstandard
 
-# 3. 命令行验证（不开服务也能看）
-python run.py wechat --days 7
+# 3. 词云需要 jieba（没装会自动退回「CJK 二元组」分词，质量差一些）
+pip install jieba
+
+# 4. 命令行验证（不开服务也能看）
+python run.py wechat --days 7 --no-official          # 统计 + 分类，过滤公众号
+python run.py wechat --days 7 --keywords --limit 30  # 关键词词云
+python run.py wechat --days 30 --keywords --category project   # 只看项目群
 ```
 
 `app/wechat.py` 复用 `source/wechat_cli` 的解密与查询内核（若环境里已装 `wechat-cli` 包则优先用包）。
 密钥/配置在 `~/.wechat-cli/`，不在本仓库内。微信数据不可用时接口返回 `503`，邮件功能不受影响。
+
+### 会话分类规则（`app/wechat_classify.py`）
+
+| 分类 | 判据 | 备注 |
+| --- | --- | --- |
+| 项目群 `project` | 群名以 `#` 开头 | `#某项目 香港团队` → 项目名 `某项目`；`#` 后切到「…项目」，否则取第一段 |
+| 同事 `colleague` | 备注以 `YY-` / `YYHK-` 开头 | 大小写随意、可带空格；`YY某地 - 某项目` 记为 `YY某地`（用友某地） |
+| 公众号 `official` | username `gh_` 开头或 `@app` 结尾 | 「隐藏公众号」过滤的对象之一 |
+| 系统通知 `system` | 微信内置账号 | `weixin` / `filehelper` / `*sessionholder` / `@placeholder_foldgroup` … |
+| 企业微信 `wecom` | username 含 `@openim` | |
+| 其他群 `group` / 个人好友 `private` | 兜底 | |
+
+词云抽样：每个会话只取「最近 N 条文本」（7 天内 800、31 天内 400、90 天内 150、全部时间 40），
+分层抽样保证不被话痨群带偏，响应里的 `per_chat_cap` 会告诉你当前额度。
 
 ## 主题
 
@@ -86,8 +108,11 @@ python run.py wechat --days 7
 | GET  | `/api/ai/inbox` | AI 首选：结构化邮件列表，正文按 `body_chars` 截断 |
 | GET  | `/api/ai/digest` | 按 sender/date/subject/folder 聚合统计 |
 | GET  | `/api/ai/verify` | 校验时间窗内各目录数量与日期范围 |
-| GET  | `/api/wechat/overview` | 微信全局统计（`days=7`，`days=0` 全部时间，`refresh=1` 强制重扫） |
-| GET  | `/api/wechat/sessions` | 微信最近会话（含未读数） |
+| GET  | `/api/wechat/overview` | 微信全局统计 + 分类分布 `by_category` / 项目分布 `by_project`（`days=7`，`days=0` 全部时间，`exclude_official=1` 过滤公众号，`refresh=1` 强制重扫） |
+| GET  | `/api/wechat/keywords` | 关键词词云（`days` + `limit` + `category` + `mine=all\|me\|others`，默认过滤公众号） |
+| GET  | `/api/wechat/categories` | 分类字典与判据（前端画筛选器用） |
+| GET  | `/api/wechat/recent` | 跨会话最新消息流（支持 `exclude_official` / `category`） |
+| GET  | `/api/wechat/sessions` | 微信最近会话（含未读数与分类标签） |
 | GET  | `/api/wechat/history` | 某微信会话的最近消息（`chat` + `days` + `limit`） |
 | GET  | `/api/wechat/stats` | 某微信会话统计（类型 / 发言排行 / 24 小时） |
 | GET  | `/api/wechat/status` | 微信数据可用性自检 |

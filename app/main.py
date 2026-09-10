@@ -50,6 +50,13 @@ def _warmup() -> None:
         remote_folders(refresh=True)   # 顺手把目录清单缓存填好
     except Exception:
         pass
+    # jieba 首次 import 要载词典（约 1s），提前吃掉，词云面板第一次就快
+    try:
+        from .wechat_classify import tokenize
+
+        tokenize("预热分词器")
+    except Exception:
+        pass
 
 
 @asynccontextmanager
