@@ -1104,6 +1104,15 @@
     return wrap;
   }
 
+  /* 天数太多时按月聚合，否则柱子会挤成一片 */
+  function bucketDays(map) {
+    const entries = Object.entries(map);
+    if (entries.length <= 40) return entries.map(([k, v]) => [k.slice(5), v]);
+    const byMonth = {};
+    entries.forEach(([k, v]) => { byMonth[k.slice(0, 7)] = (byMonth[k.slice(0, 7)] || 0) + v; });
+    return Object.entries(byMonth).map(([k, v]) => [k.slice(2).replace("-", "/"), v]);
+  }
+
   function wxTypes(list) {
     const wrap = el("div", "wx-types");
     if (!list.length) return el("div", "wx-last", "无数据");
@@ -1212,8 +1221,13 @@
     const left = el("div");
     const right = el("div");
 
-    const pDay = wxPanel("每日消息量", `${Object.keys(d.by_day).length} 天`);
-    pDay.appendChild(wxBars(Object.entries(d.by_day).map(([k, v]) => [k.slice(5), v])));
+    const dayCount = Object.keys(d.by_day).length;
+    const monthly = dayCount > 40;
+    const pDay = wxPanel(
+      monthly ? "消息量趋势（按月）" : "每日消息量",
+      `${dayCount} 天${monthly ? " · 按月聚合" : ""}`
+    );
+    pDay.appendChild(wxBars(bucketDays(d.by_day)));
     left.appendChild(pDay);
 
     const pHour = wxPanel("24 小时分布", "本地时间");
