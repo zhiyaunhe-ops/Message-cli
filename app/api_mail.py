@@ -94,6 +94,8 @@ def ai_schema():
             {"method": "PUT", "path": f"{base}/config/ai", "desc": "改 AI 配置（base_url/api_key/model/temperature/timeout…）"},
             {"method": "POST", "path": f"{base}/config/ai/test", "desc": "测试 AI 接口连通性"},
             {"method": "GET", "path": f"{base}/folders", "desc": "所有目录及计数 / 同步状态"},
+            {"method": "GET", "path": f"{base}/contacts", "desc": "联系人联想：从历史邮件汇总的收件人/抄送候选（写信补全用）",
+             "params": ["q", "limit"]},
             {"method": "POST", "path": f"{base}/sync", "desc": "从 IMAP 增量同步到本地索引",
              "body": {"folder": "INBOX", "since": DEFAULT_SINCE, "limit": 500, "force": False, "with_body": True}},
             {"method": "GET", "path": f"{base}/status", "desc": "服务与索引健康状态"},
@@ -221,6 +223,51 @@ def folders(refresh: bool = Query(False, description="跳过缓存，强制回�
     return {"folders": out, "count": len(out), "cached": not refresh and CACHE_KEY_FOLDERS_REMOTE in ctx.cache.keys()}
 
 
+# ---------------------------------------------------------------- 联系人联想
+CACHE_KEY_CONTACTS = "mail:contacts"
+CONTACTS_TTL = 600      # 本地聚合，纯 CPU；同步/发信后会主动失效
+
+
+def _contacts() -> list[dict]:
+    hit = ctx.cache.get(CACHE_KEY_CONTACTS)
+    if hit is None:
+        hit = store().contact_index(own_emails())
+        ctx.cache.put(CACHE_KEY_CONTACTS, hit, ttl=CONTACTS_TTL)
+    return hit
+
+
+@router.get("/api/contacts", summary="联系人联想：历史邮件的收件人/抄送候选")
+def list_contacts(
+    q: str = Query("", description="姓名或邮箱片段；可用空格分词，全部命中才算匹配"),
+    limit: int = Query(default=8, ge=1, le=50),
+):
+    """写信时收件人 / 抄送的自动补全数据源。
+
+    排序：前缀命中 > 词内命中；同档按往来次数、最近通信时间。q 为空则直接给最常联系的人。
+    """
+    index = _contacts()
+    tokens = [t for t in re.split(r"[\s,;，；]+", (q or "").strip().lower()) if t]
+    if not tokens:
+        return {"total": len(index), "query": q, "items": index[:limit]}
+
+    hits: list[tuple] = []
+    for c in index:
+        name = (c["name"] or "").lower()
+        email = c["email"]
+        hay = f"{name} {email}"
+        if not all(t in hay for t in tokens):
+            continue
+        if all(name.startswith(t) for t in tokens) or all(email.startswith(t) for t in tokens):
+            tier = 0        # 各词全是前缀命中
+        elif name.startswith(tokens[0]) or email.startswith(tokens[0]):
+            tier = 1        # 首词前缀命中
+        else:
+            tier = 2        # 仅词内命中
+        hits.append((tier, -c["addressed"], -c["weight"], -c["count"], -c["last_ts"], c))
+    hits.sort(key=lambda x: x[:5])
+    return {"total": len(hits), "query": q, "items": [h[5] for h in hits[:limit]]}
+
+
 # ---------------------------------------------------------------- 同步
 class SyncRequest(BaseModel):
     folder: str | list[str] | None = None
@@ -271,6 +318,7 @@ def do_sync(req: SyncRequest):
         # 同步时顺手拿到的目录清单直接更新缓存，省掉 /api/folders 的一次回源
         if fresh:
             ctx.cache.put(CACHE_KEY_FOLDERS_REMOTE, fresh, ttl=FOLDERS_TTL)
+        ctx.cache.invalidate(CACHE_KEY_CONTACTS)   # 新邮件可能带来新联系人
         ctx.sync.last_sync = {"at": time.time(), "results": results}
         return {
             "ok": True,
@@ -407,6 +455,18 @@ def trash_message(uid: int, folder: str = "INBOX"):
 
 
 # ---------------------------------------------------------------- 发信（SMTP）
+def _format_pair(name: str, addr: str) -> str:
+    return addr if (not name or name == addr) else mailout.formataddr_safe(name, addr)
+
+
+def _without_self(raw: str, me: str) -> str:
+    """去掉收件人/抄送里的自己 —— 「回复全部」最容易把自己带上。"""
+    if not raw or not me:
+        return raw
+    pairs = [(n, a) for n, a in mailout.parse_addresses(raw) if (a or "").strip().lower() != me]
+    return ", ".join(_format_pair(n, a) for n, a in pairs)
+
+
 @router.post("/api/send", summary="发邮件（SMTP，可选附件，自动存副本到已发送）")
 def send_mail(
     to: str = Form(..., description="收件人，多个用逗号分隔；支持 Name <a@b.com> 形式"),
@@ -421,6 +481,10 @@ def send_mail(
 ):
     acc = account()
     s = store()
+
+    me = (acc.email or "").strip().lower()
+    to = _without_self(to, me)
+    cc = _without_self(cc, me)
 
     in_reply_to, references = "", ""
     orig_subject = ""
@@ -489,6 +553,8 @@ def send_mail(
             draft_removed = True
         except Exception as e:
             ctx.sync.log_add(f"draft cleanup failed: {e}")
+
+    ctx.cache.invalidate(CACHE_KEY_CONTACTS)   # 刚联系过的人排到前面
 
     return {
         "ok": True,
@@ -690,7 +756,9 @@ def get_thread(
 @router.post("/api/reindex", summary="重建本地派生索引（分类 + 会话归组）")
 def do_reindex(classify_all: bool = False, rebuild: bool = True):
     try:
-        return {"ok": True, **reindex(classify_all=classify_all, rebuild=rebuild)}
+        out = reindex(classify_all=classify_all, rebuild=rebuild)
+        ctx.cache.invalidate(CACHE_KEY_CONTACTS)
+        return {"ok": True, **out}
     except Exception as e:
         raise HTTPException(500, f"重建索引失败: {e}")
 

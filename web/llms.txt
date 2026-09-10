@@ -28,6 +28,7 @@
 
 - GET  /api/status                       服务、账号、各目录计数、分类统计、会话统计
 - GET  /api/folders                      目录列表（含总数/未读数）
+- GET  /api/contacts                     联系人联想；参数 q（姓名/邮箱片段，可空格分词）/limit；返回 [{name,email,count,weight,addressed,last_ts}]，按「我写过信的人 → 往来频次」排序，写信收件人/抄送补全用
 - POST /api/sync                         增量同步；body: {folder|all_folders, since, limit, force, with_body}
 - POST /api/reindex                      重建派生索引（分类+会话归组）；body: {classify_all, rebuild}
 - GET  /api/categories                   分类统计：无聊邮件占比、各类数量、会话数
@@ -38,7 +39,7 @@
 - DELETE /api/messages/{uid}?folder=...  删除邮件：COPY 到回收站 + \Deleted + EXPUNGE，本地索引同步清除
 - POST /api/send                         发邮件（SMTP，multipart/form-data）：to(必填)/cc/subject/body/reply_folder/reply_uid/draft_folder/draft_uid/files[]；副本自动 APPEND 回已发送并同步进索引，带 draft_uid 时顺手清掉草稿
 - POST /api/drafts                       存草稿（JSON）；body: {to, cc, subject, body, draft_folder, draft_uid}；带 draft_uid 时替换上一版，不会堆积
-- POST /api/compose/ai                   AI 写正文（JSON）；body: {to, cc, subject, body, recent}；读收件人最近 N 封往来邮件 + 当前草稿，返回 3 个场景方案 {options:[{title,body}]}
+- POST /api/compose/ai                   AI 写正文（JSON）；body: {to, cc, subject, body, recent}；读收件人最近 N 封往来邮件 + 当前草稿，返回 3 个场景方案 {options:[{title, subject, body}]}（subject 为可选主题建议，可能为空串）
 - GET  /api/config/ai                    读 AI 配置（密钥打码），来源 config/app.toml
 - PUT  /api/config/ai                    改 AI 配置；body: {enabled, base_url, api_key, model, temperature, timeout, recent_count, context_chars}（api_key 留空=不改）
 - POST /api/config/ai/test               测试 AI 接口连通性

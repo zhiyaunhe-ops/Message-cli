@@ -27,6 +27,7 @@
     showExternal: false,    // 是否显示外链图片（防追踪，默认屏蔽）
     viewMode: "message",    // message | thread
     category: "all",        // all | personal | boring | meeting | automated | promotion
+    me: "",                 // 自己的地址（回复全部时要把自己剔掉）
     // —— 微信模块 ——
     // hideOfficial: 过滤公众号/系统通知；cat: 分类筛选；kwMine: 词云口径
     wechat: {
@@ -37,10 +38,15 @@
     // reply : {folder, uid} 表示这封是回复
     // draft : {folder, uid} 服务器草稿箱里对应的那一版（自动保存时替换它，避免堆积）
     // dirty : 内容被改过，需要落草稿；timer: 防抖句柄
-    compose: { reply: null, draft: null, dirty: false, timer: null, sending: false },
+    // files : 已添加的附件（File 对象数组，自己维护才能逐个移除）
+    // ai    : 最近一次 AI 生成的结果，收起面板后仍留着，可以再展开
+    compose: { reply: null, draft: null, dirty: false, timer: null, sending: false, files: [], ai: null },
   };
 
   const DRAFT_DEBOUNCE = 1800;  // 停止输入 1.8s 后自动存草稿
+
+  // 收件人 / 抄送 chip 输入框（DOM 就绪后在 bind() 里实例化）
+  const chips = { to: null, cc: null };
 
   const $ = (sel) => document.querySelector(sel);
   const el = (tag, cls, text) => {
@@ -234,6 +240,7 @@
     state.folder = name;
     state.offset = 0;
     state.current = null;
+    setReading(false);            // 换目录就回到列表（手机上是整屏覆盖层）
     $("#listTitle").textContent = folderLabel(name) + (state.viewMode === "thread" ? " · 会话" : "");
     renderFolders();
     $("#reader").innerHTML =
@@ -344,10 +351,26 @@
   }
 
   /* ------------------------------ 阅读 ------------------------------ */
+  // 窄屏（手机）上阅读区是整屏覆盖层：靠 body.is-reading 滑出来，返回按钮收起来。
+  function setReading(on) {
+    document.body.classList.toggle("is-reading", !!on);
+  }
+
+  /** 只有在窄屏才看得见的「‹ 返回列表」，插在阅读区最前面。 */
+  function readerBackBar(label) {
+    const bar = el("div", "reader-back-bar");
+    const b = el("button", "reader-back", `‹ ${label || "返回列表"}`);
+    b.type = "button";
+    b.onclick = () => setReading(false);
+    bar.appendChild(b);
+    return bar;
+  }
+
   async function openMessage(folder, uid, row) {
     document.querySelectorAll(".msg-row").forEach((n) => n.classList.remove("is-selected"));
     if (row) row.classList.add("is-selected");
 
+    setReading(true);
     const reader = $("#reader");
     reader.innerHTML = '<div class="empty">加载中…</div>';
     try {
@@ -366,7 +389,9 @@
         }).catch(() => {});
       }
     } catch (e) {
-      reader.innerHTML = `<div class="empty">读取失败：${e.message}</div>`;
+      reader.innerHTML = "";
+      reader.appendChild(readerBackBar("返回列表"));
+      reader.appendChild(el("div", "empty", `读取失败：${e.message}`));
     }
   }
 
@@ -517,6 +542,7 @@
   function renderReader(m) {
     const reader = $("#reader");
     reader.innerHTML = "";
+    reader.appendChild(readerBackBar("返回列表"));
 
     const hasHtml = !!(m.body_html && m.body_html.trim());
     const hasText = !!(m.body_text && m.body_text.trim());
@@ -546,8 +572,8 @@
     if (/draft|草稿/i.test(m.folder || "")) {   // 草稿箱里的邮件可以直接接着写
       const editBtn = el("button", "btn btn-primary", "✏ 继续编辑");
       editBtn.onclick = () => openCompose({
-        to: (m.to || []).map((t) => t.email || t.name || "").filter(Boolean).join(", "),
-        cc: (m.cc || []).map((t) => t.email || t.name || "").filter(Boolean).join(", "),
+        to: msgAddrs(m, "to"),
+        cc: msgAddrs(m, "cc"),
         subject: m.subject || "",
         body: m.body_text || "",
         draft: { folder: m.folder, uid: m.uid },
@@ -556,12 +582,9 @@
     }
 
     const replyBtn = el("button", "btn", "↩ 回复");
-    replyBtn.onclick = () => openCompose({
-      to: replyTargetOf(m),
-      subject: /^re:/i.test(m.subject || "") ? m.subject : "Re: " + (m.subject || ""),
-      reply: { folder: m.folder, uid: m.uid },
-    });
+    replyBtn.onclick = () => composeReply(m, false);
     bar.appendChild(replyBtn);
+    bar.appendChild(replyAllBtn(m));
 
     const delBtn = el("button", "btn btn-danger", "🗑 删除");
     delBtn.onclick = () => deleteMessage(m.folder, m.uid);
@@ -733,6 +756,7 @@
 
     const reader = $("#reader");
     reader.innerHTML = '<div class="empty">加载中…</div>';
+    setReading(true);
     try {
       const t = await api(`/api/threads/${threadId}?body_chars=60000&body_format=both`);
       renderChat(t);
@@ -753,7 +777,9 @@
         });
       }
     } catch (e) {
-      reader.innerHTML = `<div class="empty">读取失败：${e.message}</div>`;
+      reader.innerHTML = "";
+      reader.appendChild(readerBackBar("返回列表"));
+      reader.appendChild(el("div", "empty", `读取失败：${e.message}`));
     }
   }
 
@@ -785,6 +811,7 @@
   function renderChat(t) {
     const reader = $("#reader");
     reader.innerHTML = "";
+    reader.appendChild(readerBackBar("返回列表"));
 
     const bar = el("div", "reader-bar");
     bar.appendChild(el("span", "chat-stat", `${t.message_count} 封 · ${t.participant_count} 人 · ${t.unread ? t.unread + " 未读" : "全部已读"}`));
@@ -808,12 +835,9 @@
     const lastIn = [...(t.messages || [])].reverse().find((m) => !m.mine) || last;
     if (lastIn) {
       const replyBtn = el("button", "btn", "↩ 回复");
-      replyBtn.onclick = () => openCompose({
-        to: replyTargetOf(lastIn),
-        subject: /^re:/i.test(t.subject || "") ? t.subject : "Re: " + (t.subject || ""),
-        reply: { folder: lastIn.folder, uid: lastIn.uid },
-      });
+      replyBtn.onclick = () => composeReply(lastIn, false);
       bar.appendChild(replyBtn);
+      bar.appendChild(replyAllBtn(lastIn));
     }
     bar.appendChild(backBtn);
     reader.appendChild(bar);
@@ -890,12 +914,9 @@
       foot.appendChild(el("span", "bubble-folder", folderLabel(m.folder)));
       foot.appendChild(el("span", "bubble-size", `UID ${m.uid}`));
       const rBtn = el("button", "bubble-open", "↩ 回复");
-      rBtn.onclick = () => openCompose({
-        to: replyTargetOf(m),
-        subject: /^re:/i.test(m.subject || "") ? m.subject : "Re: " + (m.subject || ""),
-        reply: { folder: m.folder, uid: m.uid },
-      });
+      rBtn.onclick = () => composeReply(m, false);
       foot.appendChild(rBtn);
+      foot.appendChild(replyAllBtn(m, "bubble-open"));
       const dBtn = el("button", "bubble-open bubble-del", "🗑 删除");
       dBtn.onclick = () => deleteMessage(m.folder, m.uid);
       foot.appendChild(dBtn);
@@ -921,12 +942,293 @@
     inner.scrollTop = inner.scrollHeight;
   }
 
+  /* ------------------------------ 收件人 / 抄送：chip 输入框 ------------------------------
+     一个收件人就是一个「框」，输入时按历史邮件做相近联想。
+     内部只维护 values = [{name, email}]，提交时再序列化成 "Name <a@b.com>, ..."，
+     所以后端 /api/send 与 /api/drafts 的 to / cc 字段依然是普通的逗号分隔字符串。 */
+
+  const CHIP_SEP_RE = /[,;，；\r\n\t]+/;   // 分隔符：中英文逗号 / 分号 / 换行
+
+  /** 'Zhang San <w@x.com>' / 'w@x.com' -> {name, email}；不是地址则返回 null。 */
+  function parseAddr(text) {
+    let s = String(text == null ? "" : text).trim();
+    if (!s) return null;
+    const m = s.match(/^(.*?)\s*[<＜]\s*([^>＞]+?)\s*[>＞]\s*$/);
+    if (m) {
+      const name = m[1].trim().replace(/^["']|["']$/g, "");
+      const email = m[2].trim();
+      return email.includes("@") ? { name, email } : null;
+    }
+    s = s.replace(/^["']|["']$/g, "");
+    return s.includes("@") ? { name: "", email: s } : null;
+  }
+
+  /** 把一份地址列表（字符串 / 数组 / 通讯录对象）规整成 {@name,@email} 并去重。 */
+  function normAddrs(list) {
+    if (typeof list === "string") list = list.split(CHIP_SEP_RE);
+    const out = [];
+    const seen = new Set();
+    (list || []).forEach((item) => {
+      let v = null;
+      if (typeof item === "string") v = parseAddr(item);
+      else if (item && item.email) v = { name: item.name || "", email: String(item.email).trim() };
+      if (!v || !v.email) return;
+      const k = v.email.toLowerCase();
+      if (seen.has(k)) return;
+      seen.add(k);
+      out.push(v);
+    });
+    return out;
+  }
+
+  /** 造一个 chip 输入框。root/menu/chips/input 是 index.html 里已有的四个节点。 */
+  function createChipField(ids, label) {
+    const field = $(ids.field);
+    const menu = $(ids.menu);
+    const chipBox = $(ids.chips);
+    const input = $(ids.input);
+    let values = [];        // 已确认的收件人
+    let options = [];       // 当前联想候选
+    let active = -1;
+    let seq = 0;            // 请求序号：只认最后一次返回
+    let timer = null;
+
+    const has = (email) => values.some((v) => v.email.toLowerCase() === String(email || "").toLowerCase());
+
+    function render() {
+      chipBox.innerHTML = "";
+      values.forEach((v, i) => {
+        const c = el("span", "chip");
+        c.title = v.name ? `${v.name} <${v.email}>` : v.email;
+        if (v.name) c.appendChild(el("span", "chip-name", v.name));
+        c.appendChild(el("span", "chip-addr", v.name ? `<${v.email}>` : v.email));
+        const x = el("button", "chip-x", "×");
+        x.type = "button";
+        x.title = "移除";
+        x.onmousedown = (e) => e.preventDefault();
+        x.onclick = () => { values.splice(i, 1); render(); markComposeDirty(); input.focus(); };
+        c.appendChild(x);
+        chipBox.appendChild(c);
+      });
+    }
+
+    function setBad(on) {
+      field.classList.toggle("is-bad", !!on);
+      if (on) setTimeout(() => field.classList.remove("is-bad"), 1600);
+    }
+
+    function add(v) {
+      if (!v || !v.email) return false;
+      if (has(v.email)) { toast(`「${v.email}」已在${label}里`, 2200); return false; }
+      values.push({ name: v.name || "", email: v.email });
+      render();
+      markComposeDirty();
+      return true;
+    }
+
+    function closeMenu() {
+      menu.hidden = true;
+      menu.innerHTML = "";
+      options = [];
+      active = -1;
+    }
+
+    function highlight() {
+      [...menu.querySelectorAll(".chip-opt")].forEach((n, i) => n.classList.toggle("is-active", i === active));
+    }
+
+    function drawMenu() {
+      menu.innerHTML = "";
+      if (!options.length) {
+        const q = input.value.trim();
+        menu.appendChild(el("div", "chip-menu-hint",
+          q ? `没有匹配「${q}」的联系人 · 输入完整邮箱后按回车可直接填入`
+            : `还没有可推荐的联系人（同步邮件后就能按姓名/邮箱联想了）`));
+        menu.hidden = false;
+        return;
+      }
+      options.forEach((o, i) => {
+        const row = el("div", "chip-opt" + (i === active ? " is-active" : ""));
+        row.appendChild(el("span", "chip-opt-name", o.name || o.email.split("@")[0]));
+        row.appendChild(el("span", "chip-opt-mail", o.name ? o.email : ""));
+        if (o.count) row.appendChild(el("span", "chip-opt-meta", `${o.count} 封`));
+        row.onmousedown = (e) => { e.preventDefault(); pick(i); };
+        row.onmouseenter = () => { active = i; highlight(); };
+        menu.appendChild(row);
+      });
+      menu.hidden = false;
+    }
+
+    function pick(i) {
+      const o = options[i];
+      if (!o) return false;
+      input.value = "";
+      add(o);
+      closeMenu();
+      input.focus();
+      return true;
+    }
+
+    async function refresh() {
+      const q = input.value.trim();
+      const my = ++seq;
+      try {
+        const r = await api(`/api/contacts?q=${encodeURIComponent(q)}&limit=7`);
+        if (my !== seq) return;
+        options = (r.items || []).filter((o) => !has(o.email));
+        active = options.length ? 0 : -1;
+        drawMenu();
+      } catch (e) {
+        if (my !== seq) return;
+        closeMenu();      // 联想服务挂了也不影响手输地址
+      }
+    }
+
+    function scheduleRefresh() {
+      clearTimeout(timer);
+      timer = setTimeout(refresh, 160);
+    }
+
+    /** 把输入框里还没确认的文字变成 chip；返回是否吃掉了内容。 */
+    function commit() {
+      const raw = input.value.trim();
+      if (!raw) return false;
+      const parts = raw.split(CHIP_SEP_RE).map((s) => s.trim()).filter(Boolean);
+      let added = 0;
+      let bad = "";
+      parts.forEach((p) => {
+        let v = parseAddr(p);
+        if (!v) {
+          // 只输了名字没输邮箱：拿当前候选里同名的顶上（唯一候选也认）
+          const low = p.toLowerCase();
+          const hit = options.find((o) => (o.name || "").toLowerCase() === low)
+            || (options.length === 1 ? options[0] : null);
+          if (hit) v = { name: hit.name || "", email: hit.email };
+        }
+        if (v) { if (add(v)) added++; }
+        else bad = p;
+      });
+      if (added) input.value = bad ? bad : "";
+      if (added) closeMenu();
+      else if (bad) setBad(true);
+      else input.value = "";        // 只剩分隔符，清掉
+      return added > 0;
+    }
+
+    input.addEventListener("keydown", (e) => {
+      if (e.isComposing) return;                      // 中文输入法组词中，回车不是确认
+      const k = e.key;
+      if (k === "Enter") {
+        e.preventDefault();
+        const typed = input.value.trim();
+        if (typed.includes("@") && parseAddr(typed)) { commit(); return; }
+        if (!menu.hidden && active >= 0 && options[active]) { pick(active); return; }
+        commit();
+        return;
+      }
+      if (k === "," || k === ";" || k === "，" || k === "；") {
+        e.preventDefault();
+        commit();
+        return;
+      }
+      if (k === "Backspace" && !input.value && values.length) {
+        values.pop();
+        render();
+        markComposeDirty();
+        return;
+      }
+      if (k === "ArrowDown" || k === "ArrowUp") {
+        e.preventDefault();
+        if (menu.hidden) { refresh(); return; }
+        if (!options.length) return;
+        active = k === "ArrowDown"
+          ? (active + 1) % options.length
+          : (active <= 0 ? options.length - 1 : active - 1);
+        highlight();
+        return;
+      }
+      if (k === "Escape") {
+        if (!menu.hidden) { e.stopPropagation(); closeMenu(); }
+      }
+    });
+
+    input.addEventListener("input", scheduleRefresh);
+    input.addEventListener("focus", refresh);
+    input.addEventListener("blur", () => {
+      commit();
+      closeMenu();
+    });
+    input.addEventListener("paste", (e) => {
+      const txt = (e.clipboardData || window.clipboardData).getData("text") || "";
+      if (!txt || !CHIP_SEP_RE.test(txt)) return;      // 单个地址走默认粘贴
+      e.preventDefault();
+      normAddrs(txt).forEach(add);
+    });
+    field.addEventListener("mousedown", (e) => {
+      if (e.target === field) { e.preventDefault(); input.focus(); }
+    });
+
+    return {
+      setValues: (list) => { values = normAddrs(list); render(); },
+      serialize: () => values.map((v) => (v.name ? `${v.name} <${v.email}>` : v.email)).join(", "),
+      flush: commit,
+      isEmpty: () => values.length === 0,
+      focus: () => input.focus(),
+    };
+  }
+
+  /* ------------------------------ 写信纯逻辑（可单测） ------------------------------ */
+
+  /** 附件的身份：同名 + 同大小 + 同修改时间，视为同一个文件。 */
+  function fileKey(f) {
+    return [f && f.name, f && f.size, f && f.lastModified].join("|");
+  }
+
+  /** 往附件列表里追加，重复的不加；返回真正新增的数量（原地改 list）。 */
+  function appendFiles(list, files) {
+    const seen = new Set(list.map(fileKey));
+    let added = 0;
+    for (const f of files || []) {
+      const k = fileKey(f);
+      if (seen.has(k)) continue;
+      seen.add(k);
+      list.push(f);
+      added++;
+    }
+    return added;
+  }
+
+  function removeFileAt(list, index) {
+    if (!(index >= 0 && index < list.length)) return false;
+    list.splice(index, 1);
+    return true;
+  }
+
+  function sumBytes(list) {
+    return (list || []).reduce((n, f) => n + (f && f.size ? f.size : 0), 0);
+  }
+
+  /** 套用 AI 方案：正文一定替换；只有 withSubject 为真且方案带了主题时才动主题。 */
+  function applyAiOption(fields, opt, withSubject) {
+    const cur = fields || {};
+    const sub = (opt && opt.subject) || "";
+    const useSubject = !!(withSubject && sub);
+    return {
+      body: (opt && opt.body) || "",
+      subject: useSubject ? sub : (cur.subject || ""),
+      subjectUsed: useSubject,
+    };
+  }
+
   /* ------------------------------ 写邮件 / 删除 ------------------------------ */
 
   function composeFields() {
+    // 输入框里还没回车的地址先转成 chip，免得「输了一半就点发送」丢人
+    if (chips.to) chips.to.flush();
+    if (chips.cc) chips.cc.flush();
     return {
-      to: $("#cTo").value.trim(),
-      cc: $("#cCc").value.trim(),
+      to: chips.to ? chips.to.serialize() : "",
+      cc: chips.cc ? chips.cc.serialize() : "",
       subject: $("#cSubject").value.trim(),
       body: $("#cBody").value,
     };
@@ -943,6 +1245,55 @@
   }
 
   function setDraftStatus(text) { $("#draftStatus").textContent = text || ""; }
+
+  /* ---- 附件：自己维护一份 File 列表，才能一个个移除 ---- */
+  function paintFileList() {
+    const box = $("#cFileList");
+    const files = state.compose.files;
+    box.innerHTML = "";
+    box.hidden = !files.length;
+    files.forEach((f, i) => {
+      const item = el("div", "file-item");
+      item.appendChild(el("span", "file-item-name", f.name));
+      item.appendChild(el("span", "file-item-size", fmtBytes(f.size)));
+      const x = el("button", "file-item-x", "×");
+      x.type = "button";
+      x.title = "移除这个附件";
+      x.setAttribute("aria-label", `移除附件 ${f.name}`);
+      x.onclick = () => {
+        removeFileAt(files, i);
+        paintFileList();
+        markComposeDirty();
+      };
+      item.appendChild(x);
+      box.appendChild(item);
+    });
+    $("#cFileNames").textContent = files.length
+      ? `共 ${files.length} 个 · ${fmtBytes(sumBytes(files))}`
+      : "";
+    $("#cFiles").value = "";   // 清空 input，才能再次选中同一个文件
+  }
+
+  function addComposeFiles(list) {
+    const n = appendFiles(state.compose.files, list);
+    paintFileList();
+    if (n) {
+      markComposeDirty();
+      toast(`已添加 ${n} 个附件`, 1800);
+    } else if (list && list.length) {
+      toast("这些附件已经在列表里了", 1800);
+    }
+    return n;
+  }
+
+  /* ---- AI 面板：收起后结果留着，点按钮还能再展开 ---- */
+  function setAiPanel(open) {
+    const opts = (state.compose.ai && state.compose.ai.options) || [];
+    const has = opts.length > 0;
+    $("#aiOpts").hidden = !(has && open);
+    $("#aiToggle").hidden = !(has && !open);
+    $("#aiToggle").textContent = has ? `✨ AI 建议 · ${opts.length}` : "✨ AI 建议";
+  }
 
   /* ---- 草稿自动保存：停止输入 1.8s 存一次；关窗/关页面立刻存 ---- */
   function markComposeDirty() {
@@ -988,20 +1339,22 @@
     state.compose.draft = prefill.draft || null;
     state.compose.dirty = false;
     state.compose.sending = false;
+    state.compose.files = [];
+    state.compose.ai = null;
     $("#composeTitle").textContent =
       state.compose.reply ? "回复邮件" : (state.compose.draft ? "编辑草稿" : "写邮件");
-    $("#cTo").value = prefill.to || "";
-    $("#cCc").value = prefill.cc || "";
+    chips.to.setValues(prefill.to || "");
+    chips.cc.setValues(prefill.cc || "");
+    $("#cTo").value = "";
+    $("#cCc").value = "";
     $("#cSubject").value = prefill.subject || "";
     $("#cBody").value = prefill.body || "";
-    $("#cFiles").value = "";
-    $("#cFileNames").textContent = "";
+    paintFileList();
     setComposeStatus("");
     setDraftStatus(state.compose.draft ? `正在编辑草稿箱里的这一版（保存会覆盖它）` : "");
-    $("#aiOpts").hidden = true;
-    $("#aiOpts").innerHTML = "";
+    setAiPanel(false);
     $("#composeModal").hidden = false;
-    setTimeout(() => $("#cTo").focus(), 60);
+    setTimeout(() => chips.to.focus(), 60);
   }
 
   /** 关窗：先把没存的内容落进草稿箱，再收起 —— 误关/拖选误关都不会丢内容。 */
@@ -1011,46 +1364,150 @@
       saveDraft(true).then((d) => {
         if (d) toast(`已存入「${folderLabel(d.folder)}」`, 2600);
       });
+    } else if (state.compose.files.length) {
+      // 草稿接口不存附件，得提前说一声，免得下次打开发现附件没了
+      toast(`有 ${state.compose.files.length} 个附件：草稿存不了附件，下次请重新添加`, 4000);
     }
     clearTimeout(state.compose.timer);
     $("#aiOpts").hidden = true;
+    $("#aiToggle").hidden = true;
     $("#composeModal").hidden = true;
   }
 
   function replyTargetOf(m) {
-    // 回复对象：自己发的信 -> 回给收件人；别人发的 -> 回给发件人
-    return m.mine || m.folder === "Sent Items" || m.folder === "Drafts"
-      ? ((m.to || []).map((t) => t.email).filter(Boolean).join(", "))
-      : ((m.from || {}).email || "");
+    // 单个「回复」：自己发的信 -> 回给原收件人；别人发的 -> 回给发件人
+    if (m.mine || m.folder === "Sent Items" || m.folder === "Drafts") return msgAddrs(m, "to");
+    const from = m.from || {};
+    return from.email ? [{ name: from.name || "", email: from.email }] : [];
+  }
+
+  /** 收件人/抄送字段规整成 [{name, email}]，丢掉空值和重复。 */
+  function msgAddrs(m, which) {
+    return normAddrs(((m && m[which]) || []).map((p) => ({ name: p.name || "", email: p.email || "" })));
+  }
+
+  /** 「回复全部」：发件人 + 原收件人 + 原抄送，去掉自己和重复。 */
+  function replyAllTargets(m) {
+    const me = myAddr();
+    const from = m.from || {};
+    const head = (m.mine || !from.email) ? [] : [{ name: from.name || "", email: from.email }];
+    const to = normAddrs(head.concat(msgAddrs(m, "to"))).filter((p) => p.email.toLowerCase() !== me);
+    const toSet = new Set(to.map((p) => p.email.toLowerCase()));
+    const cc = msgAddrs(m, "cc").filter((p) => p.email.toLowerCase() !== me && !toSet.has(p.email.toLowerCase()));
+    return { to, cc };
+  }
+
+  /** 自己的地址：优先用 /api/status 拿到的，没到就退回顶栏显示的文字。 */
+  function myAddr() {
+    if (state.me) return state.me.toLowerCase();
+    const t = (($("#account") || {}).textContent || "").trim();
+    return /@/.test(t) ? t.toLowerCase() : "";
+  }
+
+  function composeReply(m, all) {
+    const t = all ? replyAllTargets(m) : { to: replyTargetOf(m), cc: [] };
+    openCompose({
+      to: t.to,
+      cc: t.cc,
+      subject: /^re:/i.test(m.subject || "") ? m.subject : "Re: " + (m.subject || ""),
+      reply: { folder: m.folder, uid: m.uid },
+    });
+  }
+
+  /** 回复全部按钮：原邮件除了自己没别人时置灰（那和普通回复没区别）。 */
+  function replyAllBtn(m, cls) {
+    const t = replyAllTargets(m);
+    const n = t.to.length + t.cc.length;
+    const b = el("button", cls || "btn", "↩↩ 回复全部");
+    b.title = n > 1 ? `发件人 + 收件人 + 抄送，共 ${n} 人` : "原邮件没有其他收件人";
+    b.disabled = n <= 1;
+    if (b.disabled) b.style.opacity = "0.4";
+    b.onclick = () => composeReply(m, true);
+    return b;
   }
 
   /* ------------------------------ AI 写正文 ------------------------------ */
 
   function renderAIOptions(r) {
+    state.compose.ai = r;
     const box = $("#aiOpts");
     box.innerHTML = "";
-    box.hidden = false;
-    box.appendChild(el("div", "ai-opts-head",
+
+    const head = el("div", "ai-opts-head");
+    head.appendChild(el("span", "ai-opts-meta",
       `AI 建议 · ${r.model} · ${r.elapsed}s · 参考了 ${r.context.count} 封与收件人的往来邮件`));
+    if (r.options.some((o) => o.subject)) {
+      // 主题是「可选补充」：用户自己写了主题时默认不覆盖，勾上才用 AI 的
+      const sw = el("label", "ai-opts-switch");
+      sw.title = "勾上后，点「用这份」会连主题一起换成 AI 建议的";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.id = "aiUseSubject";
+      cb.checked = !$("#cSubject").value.trim();
+      sw.appendChild(cb);
+      sw.appendChild(el("span", null, "同时用 AI 主题"));
+      head.appendChild(sw);
+    }
+    box.appendChild(head);
+
     (r.options || []).forEach((o, i) => {
       const card = el("div", "ai-opt");
       card.appendChild(el("div", "ai-opt-title", o.title || `方案 ${i + 1}`));
+
+      const subRow = el("div", "ai-opt-subject");
+      if (o.subject) {
+        subRow.appendChild(el("span", "ai-opt-subject-label", "主题"));
+        subRow.appendChild(el("span", "ai-opt-subject-text", o.subject));
+      } else {
+        subRow.classList.add("is-empty");
+        subRow.appendChild(el("span", "ai-opt-subject-label", "主题"));
+        subRow.appendChild(el("span", "ai-opt-subject-text", "（本次没给主题建议）"));
+      }
+      card.appendChild(subRow);
+
       card.appendChild(el("div", "ai-opt-body", o.body || ""));
+
+      const acts = el("div", "ai-opt-actions");
       const use = el("button", "btn btn-primary btn-sm", "用这份");
       use.type = "button";
       use.onclick = () => {
-        $("#cBody").value = o.body || "";
-        box.hidden = true;
+        const cb = $("#aiUseSubject");
+        const next = applyAiOption(composeFields(), o, !!(cb && cb.checked));
+        $("#cBody").value = next.body;
+        if (next.subjectUsed) $("#cSubject").value = next.subject;
+        setAiPanel(false);
         markComposeDirty();
-        toast(`已套用「${o.title || "方案 " + (i + 1)}」`, 2400);
+        toast(
+          next.subjectUsed
+            ? `已套用「${o.title || "方案 " + (i + 1)}」，主题也一起换了`
+            : `已套用「${o.title || "方案 " + (i + 1)}」`,
+          2600
+        );
       };
-      card.appendChild(use);
+      acts.appendChild(use);
+
+      if (o.subject) {
+        const onlySub = el("button", "btn btn-sm", "只用主题");
+        onlySub.type = "button";
+        onlySub.title = "只把主题填进去，正文不动";
+        onlySub.onclick = () => {
+          $("#cSubject").value = o.subject;
+          markComposeDirty();
+          toast("主题已填入", 1800);
+        };
+        acts.appendChild(onlySub);
+      }
+      card.appendChild(acts);
       box.appendChild(card);
     });
+
     const fold = el("button", "btn btn-sm", "收起");
     fold.type = "button";
-    fold.onclick = () => { box.hidden = true; };
+    fold.title = "收起后不会丢，点「✨ AI 建议」可以再展开";
+    fold.onclick = () => setAiPanel(false);
     box.appendChild(fold);
+
+    setAiPanel(true);   // 生成完直接展开
   }
 
   async function aiGenerate() {
@@ -1075,7 +1532,7 @@
         to: f.to, cc: f.cc, subject: f.subject, body: f.body,
       });
       renderAIOptions(r);
-      setComposeStatus(`生成完成，挑一份合适的即可`, true);
+      setComposeStatus("生成完成，挑一份合适的即可（收起后点「✨ AI 建议」能再展开）", true);
     } catch (err) {
       setComposeStatus("AI 生成失败：" + err.message);
     } finally {
@@ -1167,6 +1624,12 @@
     e.preventDefault();
     const btn = $("#sendBtn");
     const status = $("#composeStatus");
+    const f = composeFields();           // 顺便把输入框里没回车的地址转成 chip
+    if (!f.to) {
+      setComposeStatus("收件人不能为空：输入姓名或邮箱后按回车，会变成一个收件人框");
+      chips.to.focus();
+      return;
+    }
     state.compose.sending = true;
     clearTimeout(state.compose.timer);   // 别让待触发的自动保存插在发送中间
     btn.disabled = true;
@@ -1174,7 +1637,6 @@
     setComposeStatus("");
     try {
       const fd = new FormData();
-      const f = composeFields();
       fd.set("to", f.to);
       fd.set("cc", f.cc);
       fd.set("subject", f.subject);
@@ -1187,7 +1649,7 @@
         fd.set("draft_folder", state.compose.draft.folder);
         fd.set("draft_uid", String(state.compose.draft.uid));
       }
-      for (const file of $("#cFiles").files) fd.append("files", file, file.name);
+      for (const file of state.compose.files) fd.append("files", file, file.name);
       const r = await api("/api/send", { method: "POST", body: fd });
       toast(
         `✓ 已发送至 ${r.accepted.join("、")}` +
@@ -1197,6 +1659,7 @@
       clearTimeout(state.compose.timer);
       state.compose.dirty = false;
       state.compose.draft = null;
+      state.compose.files = [];      // 先清空，免得 closeCompose 再提示一次「附件存不进草稿」
       closeCompose();
       loadFolders();
       if (state.folder === r.sent_folder) loadCurrent(false);
@@ -1251,6 +1714,7 @@
   async function loadStatus() {
     try {
       const s = await api("/api/status");
+      state.me = (s.account && s.account.email) || "";
       $("#account").textContent = s.account.email;
       const st = s.stats || {};
       const c = s.categories || {};
@@ -1319,6 +1783,11 @@
     bindMaskClose("#composeModal", closeCompose);   // 只在遮罩上按下并抬起才关
     $("#composeForm").addEventListener("submit", submitCompose);
 
+    chips.to = createChipField(
+      { field: "#cToField", chips: "#cToChips", menu: "#cToMenu", input: "#cTo" }, "收件人");
+    chips.cc = createChipField(
+      { field: "#cCcField", chips: "#cCcChips", menu: "#cCcMenu", input: "#cCc" }, "抄送");
+
     // 正文里拖选多行时，mouseup 会落到遮罩上 —— 这不是「点遮罩关闭」，所以用
     // mousedown/mouseup 同源判断；否则编辑到一半的窗口会被拖没了。
     function bindMaskClose(sel, onClose) {
@@ -1331,7 +1800,7 @@
       });
     }
 
-    ["#cTo", "#cCc", "#cSubject", "#cBody"].forEach((sel) => {
+    ["#cSubject", "#cBody"].forEach((sel) => {
       $(sel).addEventListener("input", markComposeDirty);
     });
     $("#aiBtn").addEventListener("click", aiGenerate);
@@ -1355,9 +1824,37 @@
       } catch (e) {}
     });
 
-    $("#cFiles").addEventListener("change", (e) => {
-      const fs = [...e.target.files];
-      $("#cFileNames").textContent = fs.length ? `已选 ${fs.length} 个：${fs.map((f) => f.name).join("、")}` : "";
+    $("#cFiles").addEventListener("change", (e) => addComposeFiles(e.target.files));
+    $("#aiToggle").addEventListener("click", () => setAiPanel(true));
+
+    // 直接把文件拖进写信框也能加附件（桌面端顺手）
+    const form = $("#composeForm");
+    let dragDepth = 0;
+    form.addEventListener("dragenter", (e) => {
+      if (!e.dataTransfer || ![...e.dataTransfer.types].includes("Files")) return;
+      e.preventDefault();
+      dragDepth++;
+      form.classList.add("is-dropping");
+    });
+    form.addEventListener("dragover", (e) => {
+      if (e.dataTransfer && [...e.dataTransfer.types].includes("Files")) e.preventDefault();
+    });
+    form.addEventListener("dragleave", () => {
+      dragDepth = Math.max(0, dragDepth - 1);
+      if (!dragDepth) form.classList.remove("is-dropping");
+    });
+    form.addEventListener("drop", (e) => {
+      if (!e.dataTransfer || !e.dataTransfer.files.length) return;
+      e.preventDefault();
+      dragDepth = 0;
+      form.classList.remove("is-dropping");
+      addComposeFiles(e.dataTransfer.files);
+    });
+
+    // 手机上阅读区是整屏覆盖层，Esc / 手势返回都能收起来
+    document.addEventListener("keydown", (e) => {
+      if (e.key !== "Escape") return;
+      if (document.body.classList.contains("is-reading")) setReading(false);
     });
 
     document.querySelectorAll("#viewSeg button").forEach((b) => {
@@ -1367,6 +1864,7 @@
         document.querySelectorAll("#viewSeg button").forEach((x) => x.classList.toggle("active", x === b));
         state.current = null;
         state.offset = 0;
+        setReading(false);
         $("#listTitle").textContent = folderLabel(state.folder) + (state.viewMode === "thread" ? " · 会话" : "");
         $("#reader").innerHTML = state.viewMode === "thread"
           ? '<div class="empty">选择一条会话开始阅读</div>'

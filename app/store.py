@@ -2,12 +2,20 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import time
 from pathlib import Path
 
 from .settings import DB_FILE, ensure_dirs
+
+# 明显的机器地址（发件人是「no-reply / 通知 / 订阅推送」），联想排序时降权
+BULK_LOCAL_RE = re.compile(
+    r"^(?:no[-_.]?reply|do[-_.]?not[-_.]?reply|donotreply|notifications?|newsletters?|news|"
+    r"bounces?|mailers?|mailer-daemon|postmaster|updates?)$",
+    re.IGNORECASE,
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS folders (
@@ -428,6 +436,71 @@ class Store:
             "boring_ratio": round(boring / total, 3) if total else 0.0,
             "by_category": by,
         }
+
+    # ---------- 联系人 ----------
+    HUMAN_CATEGORIES = ("", "personal", "meeting")   # 不算「无聊邮件」的类别
+
+    def contact_index(self, exclude: set[str] | None = None, limit: int = 5000) -> list[dict]:
+        """从已索引邮件里汇总联系人（发件人 + 收件人 + 抄送），按往来频次排序。
+
+        纯本地聚合：不联网、不读通讯录，就是"我以前跟谁通过信"。
+        写信时的收件人 / 抄送联想直接吃这份结果。
+
+        count     = 总出现次数（发件算一次，收件 / 抄送各算一次）
+        addressed = 被「我」写进收件人 / 抄送的次数 —— 首排序键，只给你真正写过信的人
+                    （订阅推送再频繁也挤不到前面）
+        weight    = 去掉系统自动 / 营销后的加权次数，次排序键
+        """
+        skip = {a.strip().lower() for a in (exclude or set()) if a}
+        agg: dict[str, dict] = {}
+
+        def bump(name: str, addr: str, ts: float, w: int, addressed: int = 0) -> None:
+            e = (addr or "").strip().lower()
+            if not e or "@" not in e or e in skip or len(e) > 200:
+                return
+            if w and BULK_LOCAL_RE.match(e.split("@", 1)[0]):
+                w = 0       # no-reply 之类永远不排前面
+            nm = (name or "").strip().strip("'\"")      # 有些客户端把显示名连引号写进头里
+            rec = agg.get(e)
+            if rec is None:
+                agg[e] = {"email": e, "name": nm, "count": 1,
+                          "weight": w, "addressed": addressed, "last_ts": ts}
+                return
+            rec["count"] += 1
+            rec["weight"] += w
+            rec["addressed"] += addressed
+            if ts > rec["last_ts"]:
+                rec["last_ts"] = ts
+            if not rec["name"] and nm:
+                rec["name"] = nm
+
+        rows = self.conn.execute(
+            "SELECT from_name, from_addr, to_json, cc_json, date_ts, category FROM messages"
+        ).fetchall()
+        for r in rows:
+            ts = float(r["date_ts"] or 0)
+            w = 1 if (r["category"] or "") in self.HUMAN_CATEGORIES else 0
+            # 发件人是自己 -> 这封里的收件人/抄送就是「我主动写过的人」
+            outbound = 1 if (r["from_addr"] or "").strip().lower() in skip else 0
+            bump(r["from_name"], r["from_addr"], ts, w)
+            for field in ("to_json", "cc_json"):
+                try:
+                    people = json.loads(r[field] or "[]")
+                except Exception:
+                    continue
+                if not isinstance(people, list):
+                    continue
+                for p in people:
+                    if isinstance(p, dict):
+                        bump(p.get("name") or "", p.get("email") or "", ts, w, outbound)
+                    elif isinstance(p, str):
+                        bump("", p, ts, w, outbound)
+
+        out = sorted(
+            agg.values(),
+            key=lambda c: (-c["addressed"], -c["weight"], -c["count"], -c["last_ts"], c["email"]),
+        )
+        return out[:limit]
 
     def thread_stats(self) -> dict:
         row = self.conn.execute(

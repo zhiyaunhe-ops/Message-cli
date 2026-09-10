@@ -39,7 +39,7 @@
       <button class="btn btn-primary" id="syncBtn">同步</button>
       <button class="btn" id="settingsBtn" title="设置 · AI 接口配置">⚙</button>
       <div class="theme-picker">
-        <button class="btn" id="themeBtn">主题 · <span id="themeName">宣纸水墨</span> ▾</button>
+        <button class="btn" id="themeBtn"><span class="btn-label">主题 · </span><span id="themeName">宣纸水墨</span><span class="caret"> ▾</span></button>
         <div class="theme-menu" id="themeMenu"></div>
       </div>
     </div>
@@ -105,15 +105,28 @@
       <button class="modal-close" id="composeClose" title="关闭">×</button>
     </div>
     <form id="composeForm">
-      <input class="input" id="cTo" placeholder="收件人（多个用逗号分隔）" autocomplete="off" required>
-      <input class="input" id="cCc" placeholder="抄送（可选）" autocomplete="off">
+      <div class="chip-field" id="cToField">
+        <div class="chips" id="cToChips"></div>
+        <input class="chip-input" id="cTo" type="text" autocomplete="off" spellcheck="false"
+               placeholder="收件人（输入姓名或邮箱，回车 / 逗号确认）">
+        <div class="chip-menu" id="cToMenu" hidden></div>
+      </div>
+      <div class="chip-field" id="cCcField">
+        <div class="chips" id="cCcChips"></div>
+        <input class="chip-input" id="cCc" type="text" autocomplete="off" spellcheck="false"
+               placeholder="抄送（可选）">
+        <div class="chip-menu" id="cCcMenu" hidden></div>
+      </div>
       <input class="input" id="cSubject" placeholder="主题" autocomplete="off">
       <textarea class="input" id="cBody" rows="11" placeholder="正文…"></textarea>
       <div class="ai-opts" id="aiOpts" hidden></div>
+      <div class="file-list" id="cFileList" hidden></div>
       <div class="compose-row">
-        <label class="file-btn">📎 添加附件<input id="cFiles" type="file" multiple hidden></label>
+        <label class="file-btn" id="cFileBtn">📎 添加附件<input id="cFiles" type="file" multiple hidden></label>
         <button type="button" class="btn btn-ai" id="aiBtn"
-                title="读取与收件人的最近往来邮件 + 当前标题正文，让 AI 给出 3 个场景的正文">✨ AI 写正文</button>
+                title="读取与收件人的最近往来邮件 + 当前标题正文，让 AI 给出 3 个场景的正文与主题">✨ AI 写正文</button>
+        <button type="button" class="btn btn-ai" id="aiToggle" hidden
+                title="重新展开上一次 AI 给出的方案">✨ AI 建议</button>
         <span class="file-names" id="cFileNames"></span>
       </div>
       <div class="modal-foot">

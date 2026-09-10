@@ -586,7 +586,19 @@ body {
   background: var(--panel-2);
   overflow: hidden;
 }
-.reader-inner { flex: 1; overflow-y: auto; padding: 22px 30px 60px; }
+.reader-inner { flex: 1; min-height: 0; overflow-y: auto; padding: 22px 30px 60px; }
+/* 窄屏才出现的「‹ 返回列表」（手机上阅读区是整屏覆盖层） */
+.reader-back-bar { display: none; }
+.reader-back {
+  border: var(--border-w) solid var(--line);
+  background: var(--panel-2);
+  color: var(--text-dim);
+  border-radius: var(--radius-sm);
+  padding: 6px 14px 6px 10px;
+  font-family: inherit; font-size: 13px;
+  cursor: pointer;
+}
+.reader-back:hover { color: var(--accent); border-color: var(--accent); }
 .reader-subject { font-size: 20px; font-weight: var(--weight-head); margin: 0 0 14px; line-height: 1.4; }
 .reader-meta { display: flex; flex-direction: column; gap: 6px; margin-bottom: 16px; }
 .meta-row { display: flex; gap: 10px; font-size: 12.5px; }
@@ -932,6 +944,72 @@ body {
 }
 #composeForm .input { width: 100%; }
 #composeForm textarea.input { resize: vertical; min-height: 120px; font-family: var(--font); line-height: 1.6; }
+
+/* ---- 收件人 / 抄送：一个一个「框」（chip），带联系人联想 ---- */
+.chip-field {
+  position: relative;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 5px;
+  width: 100%;
+  min-height: 34px;
+  padding: 4px 7px;
+  background: var(--panel-2);
+  border: var(--border-w) solid var(--line);
+  border-radius: var(--radius-sm);
+  cursor: text;
+  transition: border-color 0.18s, box-shadow 0.18s;
+}
+.chip-field:focus-within { border-color: var(--accent); box-shadow: var(--shadow-sm); }
+.chip-field.is-bad { border-color: var(--danger); }
+.chips { display: contents; }          /* 让 chip 直接参与 chip-field 的换行布局 */
+.chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  max-width: 100%;
+  padding: 2px 3px 2px 8px;
+  background: var(--accent-soft);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.chip-name { font-weight: var(--weight-head); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip-addr { color: var(--text-faint); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip-x {
+  border: none; background: transparent;
+  color: var(--text-dim); font-size: 13px; line-height: 1;
+  padding: 1px 4px; border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.chip-x:hover { background: var(--hover); color: var(--accent); }
+.chip-input {
+  flex: 1 1 140px; min-width: 140px;
+  border: none; outline: none; background: transparent;
+  color: var(--text); font-family: inherit; font-size: 13px;
+  padding: 5px 2px;
+}
+.chip-input::placeholder { color: var(--text-faint); }
+.chip-menu {
+  position: absolute; left: -1px; right: -1px; top: calc(100% + 4px);
+  z-index: 40;
+  max-height: 216px; overflow-y: auto;
+  background: var(--panel);
+  border: var(--border-w) solid var(--line-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+.chip-menu[hidden] { display: none; }
+.chip-opt {
+  display: flex; align-items: baseline; gap: 8px;
+  padding: 7px 10px;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.chip-opt:hover, .chip-opt.is-active { background: var(--accent-soft); }
+.chip-opt-name { font-weight: var(--weight-head); white-space: nowrap; }
+.chip-opt-mail { flex: 1; color: var(--text-faint); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip-opt-meta { color: var(--text-faint); font-size: 11px; white-space: nowrap; }
+.chip-menu-hint { padding: 8px 10px; font-size: 11.5px; color: var(--text-faint); }
+.chip-menu-hint b { color: var(--text-dim); font-weight: var(--weight-head); }
+
 .compose-row { display: flex; align-items: center; gap: 10px; min-height: 26px; }
 .file-btn {
   display: inline-flex; align-items: center;
@@ -945,6 +1023,46 @@ body {
 }
 .file-btn:hover { border-color: var(--accent); color: var(--accent); }
 .file-names { font-size: 11px; color: var(--text-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---- 待发附件列表：一个个可以移除 ---- */
+.file-list {
+  display: flex; flex-direction: column; gap: 5px;
+  border: var(--border-w) dashed var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  padding: 7px 8px;
+}
+.file-list[hidden] { display: none; }
+.file-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 6px 5px 9px;
+  background: var(--panel);
+  border: var(--border-w) solid var(--line);
+  border-radius: var(--radius-sm);
+  font-size: 12.5px;
+}
+.file-item-name {
+  flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--text);
+}
+.file-item-size { color: var(--text-faint); font-size: 11px; flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+.file-item-x {
+  flex: 0 0 auto;
+  border: none; background: transparent;
+  color: var(--text-dim); font-size: 15px; line-height: 1;
+  padding: 2px 7px; border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.file-item-x:hover { background: var(--hover); color: #d9534f; }
+
+/* 拖拽文件到写信框 */
+#composeForm.is-dropping { outline: 2px dashed var(--accent); outline-offset: -6px; }
+#composeForm.is-dropping::after {
+  content: "松手即添加附件";
+  position: sticky; bottom: 0;
+  text-align: center; font-size: 11.5px; color: var(--accent);
+}
 .modal-foot {
   display: flex; align-items: center; gap: 9px;
   margin-top: 4px;
@@ -965,7 +1083,17 @@ body {
   background: var(--panel-2);
   padding: 10px 11px;
 }
-.ai-opts-head { font-size: 11.5px; color: var(--text-faint); }
+.ai-opts-head {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  font-size: 11.5px; color: var(--text-faint);
+}
+.ai-opts-meta { flex: 1; min-width: 0; }
+.ai-opts-switch {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 11.5px; color: var(--text-dim);
+  cursor: pointer; user-select: none; white-space: nowrap;
+}
+.ai-opts-switch input { accent-color: var(--accent); margin: 0; }
 .ai-opt {
   display: grid; gap: 6px;
   border: var(--border-w) solid var(--line);
@@ -974,12 +1102,22 @@ body {
   padding: 9px 10px;
 }
 .ai-opt-title { font-size: 12.5px; font-weight: var(--weight-head); color: var(--accent); }
+.ai-opt-subject {
+  display: flex; align-items: baseline; gap: 7px;
+  font-size: 11.5px;
+  padding: 4px 8px;
+  background: var(--panel-2);
+  border-radius: var(--radius-sm);
+}
+.ai-opt-subject.is-empty { opacity: 0.7; }
+.ai-opt-subject-label { color: var(--text-faint); flex: 0 0 auto; }
+.ai-opt-subject-text { color: var(--text); overflow-wrap: anywhere; }
+.ai-opt-actions { display: flex; gap: 7px; flex-wrap: wrap; align-items: center; justify-self: start; }
 .ai-opt-body {
   font-size: 12px; line-height: 1.55; color: var(--text-dim);
   white-space: pre-wrap; overflow-wrap: anywhere;
   max-height: 132px; overflow-y: auto;
 }
-.ai-opt .btn { justify-self: start; }
 
 /* ---- 设置弹窗 ---- */
 #settingsForm {
@@ -1200,3 +1338,115 @@ body[data-app="wechat"] #syncBtn { display: none; }
 .wx-fold-btn.is-open { color: var(--text-dim); border-style: solid; }
 .wx-fold-box { padding-left: 10px; border-left: 2px solid var(--line); }
 .wx-msgs .wx-fold-box { display: flex; flex-direction: column; gap: 6px; margin: 2px 0 4px; }
+
+/* ============================================================
+   窄屏（手机 / 竖屏平板）：目录横条 + 列表 + 整屏阅读 + 全屏弹窗
+   断点 900px：三栏在这个宽度下已经挤得没法用，直接切成单栏。
+   ============================================================ */
+@media (max-width: 900px) {
+  html { -webkit-text-size-adjust: 100%; }
+  .app { height: 100dvh; }
+
+  /* ---- 顶栏：拆成两行（品牌 + 页签 / 搜索 + 操作） ---- */
+  .topbar { flex-wrap: wrap; gap: 8px 10px; padding: 8px 12px; }
+  .brand { min-width: 0; flex: 0 1 auto; }
+  .brand-mark { width: 30px; height: 30px; font-size: 15px; }
+  .brand h1 { font-size: 14px; }
+  .brand .account { display: none; }
+  .app-seg { margin-left: auto; }
+  .app-seg button { padding: 5px 10px; font-size: 12px; }
+  .search-wrap { order: 5; flex: 1 1 100%; max-width: none; gap: 6px; }
+  .search-wrap .select { max-width: 112px; flex: 0 0 auto; padding: 7px 6px; }
+  .actions { order: 6; flex: 1 1 100%; margin-left: 0; flex-wrap: wrap; gap: 6px; }
+  .actions .btn { padding: 6px 10px; font-size: 12px; }
+  #themeBtn .btn-label, #themeBtn .caret { display: none; }   /* 只留主题名，省横向空间 */
+  .theme-menu { width: min(268px, 88vw); }
+
+  .toast { max-width: calc(100vw - 32px); bottom: 16px; font-size: 12px; }
+
+  /* ---- 三栏压成单栏：目录变成一条可以横滑的胶囊 ---- */
+  .layout { flex-direction: column; }
+  .sidebar {
+    width: 100%; flex: 0 0 auto;
+    display: flex; align-items: center; gap: 6px;
+    padding: 8px 10px;
+    overflow-x: auto; overflow-y: hidden;
+    border-right: none;
+    border-bottom: var(--border-w) solid var(--line);
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .sidebar::-webkit-scrollbar { display: none; }
+  .side-title, .side-stats { display: none; }
+  #folders { display: flex; gap: 6px; }
+  .folder-item {
+    flex: 0 0 auto; gap: 6px;
+    padding: 6px 11px;
+    background: var(--panel-2);
+    border: var(--border-w) solid var(--line);
+    border-radius: 999px;
+    font-size: 12.5px;
+    white-space: nowrap;
+  }
+  .folder-item.is-active { box-shadow: inset 0 0 0 1px var(--accent); }
+
+  .list-pane { width: 100%; flex: 1 1 auto; border-right: none; }
+  .list-head { padding: 8px 12px; gap: 6px; }
+  .list-head-title { font-size: 13px; }
+  .msg-row { padding: 12px 14px; }
+  .msg-subject { font-size: 13.5px; }
+  .empty { padding: 32px 16px; }
+
+  /* ---- 阅读窗格：整屏覆盖层，靠 body.is-reading 滑出来 ---- */
+  .reader {
+    position: fixed; inset: 0; z-index: 150;
+    display: none;
+    background: var(--bg);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  body.is-reading .reader { display: flex; }
+  .reader-back-bar { display: flex; padding: 9px 12px 0; flex: 0 0 auto; }
+  .reader-bar { flex-wrap: wrap; gap: 6px; padding: 9px 12px; }
+  .reader-bar .btn, .reader-bar .reader-back { padding: 6px 10px; font-size: 12px; }
+  .reader-bar .seg button { padding: 4px 10px; font-size: 12px; }
+  .reader-inner { padding: 14px 14px calc(72px + env(safe-area-inset-bottom, 0px)); }
+  .reader-subject { font-size: 17px; }
+  .reader-body { padding: 14px 13px; }
+  .reader-body.rich table { display: block; overflow-x: auto; }
+  .meta-label { width: 44px; flex-basis: 44px; }
+
+  /* ---- 弹窗：写信 / 设置直接铺满整屏 ---- */
+  .modal-mask { padding: 0; align-items: stretch; }
+  .modal {
+    width: 100%; max-width: none;
+    height: 100dvh; max-height: none;
+    border: none; border-radius: 0;
+  }
+  .modal-head { padding: 11px 14px; }
+  #composeForm, #settingsForm { padding: 12px 14px 16px; gap: 8px; }
+  #composeForm textarea.input { min-height: 150px; }
+  .field-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .modal-foot { flex-wrap: wrap; row-gap: 6px; }
+  .modal-foot .btn { flex: 1 1 auto; }
+  .compose-status { flex: 1 1 100%; }
+  .draft-status { flex: 1 1 100%; white-space: normal; }
+  .compose-row { gap: 7px; }
+  .file-names { flex: 1 1 100%; }
+
+  /* iOS Safari 会自动放大 <16px 的输入框，这里统一顶到 16px */
+  .input, .select, textarea.input, .chip-input { font-size: 16px; }
+
+  /* ---- 微信页签 ---- */
+  .wx-head { flex-wrap: wrap; gap: 6px; padding: 8px 12px; }
+  .wx-head h2 { font-size: 14px; }
+  .wx-meta { margin-left: 0; flex: 1 1 100%; }
+  .wx-body { padding: 10px 12px 24px; }
+  .wx-cloud .wx-word { font-size: 15px; }
+}
+
+/* 极窄屏（小屏安卓 / 分屏）：再收一档 */
+@media (max-width: 400px) {
+  .actions .btn { padding: 6px 9px; }
+  .app-seg button { padding: 5px 8px; }
+  .list-head-title { flex: 1 1 100%; }
+}

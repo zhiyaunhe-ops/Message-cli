@@ -5,6 +5,7 @@
 
 提示词是固定的（FIXED_SYSTEM / FIXED_TASK），收件人相关邮件、当前标题与正文
 作为上下文拼进去；模型必须返回严格 JSON，解析失败时退回按标题分段兜底。
+每个方案带一个可选的主题建议（subject），前端由用户决定要不要套用。
 """
 from __future__ import annotations
 
@@ -34,19 +35,23 @@ FIXED_SYSTEM = (
     "2. 只输出 JSON，不要 Markdown 代码块标记，不要任何解释文字。\n"
     "3. 严禁编造事实：不确定的金额、日期、人名、系统名等一律用占位符 [请补充]。\n"
     "4. 不写空洞客套，句子要短，能落地，符合中文商务邮件习惯。\n"
-    "5. 三个方案的正文内容必须明显不同（措辞/长度/态度），不要只是同义改写。"
+    "5. 三个方案的正文内容必须明显不同（措辞/长度/态度），不要只是同义改写。\n"
+    "6. 同时给每个方案配一个邮件主题，只写主题本身，不要出现「主题：」「Subject:」和前缀。"
 )
 
 FIXED_TASK = (
     "下面是与收件人相关的历史往来邮件（按时间倒序），以及用户当前写了一半的邮件。\n"
     "请据此给出 3 个不同场景下的完整正文，严格按以下 JSON 输出：\n"
-    '{{"options":[{{"title":"场景名（不超过 8 个字）","body":"完整邮件正文"}},'
-    '{{"title":"…","body":"…"}},{{"title":"…","body":"…"}}]}}\n'
+    '{{"options":[{{"title":"场景名（不超过 8 个字）","subject":"主题建议（不超过 30 个字）",'
+    '"body":"完整邮件正文"}},{{"title":"…","subject":"…","body":"…"}},'
+    '{{"title":"…","subject":"…","body":"…"}}]}}\n'
     "三个场景默认取向（可调，但必须在 title 里点明）：\n"
     "  · 正式得体：商务正式、结构清晰，适合首次沟通或发给领导/客户高层\n"
     "  · 简洁高效：短平快、要点式，适合日常推进与内部同步\n"
     "  · 委婉推进：语气柔和、照顾对方处境，适合催办/协调/关系维护\n"
-    "正文要求：含称呼与落款；段落之间用一个空行；不要带主题行；不要写 Markdown 标记。"
+    "正文要求：含称呼与落款；段落之间用一个空行；不要带主题行；不要写 Markdown 标记。\n"
+    "主题要求：一句话说清这封信要办什么事；用户已经填了主题就顺着他的意思打磨清楚，\n"
+    "不要加 Re: / Fwd: / 回复 这类前缀，也不要写成「关于…的事宜」这种空话。"
 )
 
 
@@ -202,8 +207,19 @@ def _between(s: str, open_ch: str, close_ch: str) -> str:
     return s[i:j + 1] if 0 <= i < j else ""
 
 
+def _clean_subject(value: Any, limit: int = 60) -> str:
+    """把模型给的主题收拾干净：去「主题：」前缀、去引号、压空白、限长。"""
+    s = re.sub(r"\s+", " ", str(value or "")).strip()
+    s = re.sub(r"^(?:主题|标题|subject)\s*[:：]\s*", "", s, flags=re.I)
+    s = s.strip().strip("\"'“”「」")
+    return s[:limit].strip()
+
+
 def parse_options(text: str) -> list[dict]:
-    """解析成 [{title, body}]；模型不听话时按「方案 N」分段兜底。"""
+    """解析成 [{title, subject, body}]；模型不听话时按「方案 N」分段兜底。
+
+    subject 允许为空（模型没给就不给），前端只在用户勾选时才会用它填主题。
+    """
     obj = _json_loads_loose(text)
     if isinstance(obj, dict):
         raw = obj.get("options") or obj.get("data") or obj.get("results")
@@ -218,8 +234,13 @@ def parse_options(text: str) -> list[dict]:
             if isinstance(it, dict):
                 body = str(it.get("body") or it.get("content") or it.get("text") or "").strip()
                 title = str(it.get("title") or it.get("name") or it.get("scenario") or "").strip()
+                subject = _clean_subject(it.get("subject") or it.get("mail_subject") or "")
                 if body:
-                    out.append({"title": title or f"方案 {len(out) + 1}", "body": body})
+                    out.append({
+                        "title": title or f"方案 {len(out) + 1}",
+                        "subject": subject,
+                        "body": body,
+                    })
     if out:
         return _dedup(out)[:3]
 
@@ -229,12 +250,12 @@ def parse_options(text: str) -> list[dict]:
         for i in range(1, len(parts) - 1, 2):
             body = parts[i + 1].strip()
             if body:
-                out.append({"title": f"方案 {(i // 2) + 1}", "body": body})
+                out.append({"title": f"方案 {(i // 2) + 1}", "subject": "", "body": body})
     if out:
         return _dedup(out)[:3]
 
     body = (text or "").strip()
-    return [{"title": "AI 草稿", "body": body}] if body else []
+    return [{"title": "AI 草稿", "subject": "", "body": body}] if body else []
 
 
 def _dedup(items: list[dict]) -> list[dict]:
