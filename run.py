@@ -134,6 +134,61 @@ def cmd_ai(args):
     print(json.dumps(data, ensure_ascii=False, indent=2))
 
 
+def cmd_wechat(args):
+    """离线打印微信统计（不启动服务）。"""
+    from app import wechat as wx
+
+    st = wx.status()
+    if not st["ok"]:
+        print(f"微信数据不可用: {st.get('error')}")
+        print("提示：微信需保持登录，然后运行 wechat-cli init")
+        return 1
+
+    if args.chat:
+        data = wx.chat_history(args.chat, days=args.days or None, limit=args.limit)
+    else:
+        data = wx.overview(days=args.days or None)
+
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.chat:
+        print(f"\n{data['chat']}（{data['range']}）共 {data['total']} 条\n")
+        for it in data["items"]:
+            who = f"{it['sender']}: " if it["sender"] else ""
+            print(f"  [{it['time']}] {who}{it['text']}")
+        return 0
+
+    print(f"\n微信统计 · 最近 {args.days} 天（{data['range']}）")
+    print(f"  消息总数   {data['total']}   （我发 {data['mine']} / 收到 {data['others']}）")
+    print(f"  活跃会话   {data['chats']} 个（群 {data['group_chats']} / 单聊 {data['private_chats']}）")
+    print(f"  群聊消息   {data['group_messages']}   单聊消息 {data['private_messages']}")
+    print(f"  当前未读   {data['unread']}")
+    print(f"  扫描范围   {data['scanned']['databases']} 个库 / {data['scanned']['tables']} 张消息表")
+
+    print("\n  每日消息量:")
+    peak = max(data["by_day"].values()) if data["by_day"] else 0
+    for d, c in data["by_day"].items():
+        print(f"    {d} |{'█' * int(c / peak * 34) if peak else ''} {c}")
+
+    print("\n  消息类型:")
+    for t in data["by_type"][:8]:
+        print(f"    {t['type']:<10} {t['count']:>6}  {t['pct']}%")
+
+    print("\n  活跃会话 Top 15:")
+    for c in data["top_chats"][:15]:
+        tag = "群" if c["is_group"] else "私"
+        print(f"    [{tag}] {c['chat'][:34]:<34} {c['count']:>6}  {c['pct']}%")
+
+    print("\n  24 小时分布:")
+    peak_h = max(data["by_hour"].values()) if data["by_hour"] else 0
+    for h in range(24):
+        c = data["by_hour"].get(str(h), 0)
+        print(f"    {h:02d}时 |{'█' * int(c / peak_h * 30) if peak_h else ''} {c}")
+    return 0
+
+
 def main():
     p = argparse.ArgumentParser(description="邮件 WebUI / API")
     sub = p.add_subparsers(dest="cmd")
@@ -168,6 +223,13 @@ def main():
     a.add_argument("--limit", type=int, default=20)
     a.add_argument("--body-chars", type=int, default=4000)
     a.set_defaults(func=cmd_ai)
+
+    w = sub.add_parser("wechat", help="微信消息统计（复用 wechat-cli 解密内核）")
+    w.add_argument("--days", type=int, default=7, help="最近 N 个自然日；0 表示全部时间")
+    w.add_argument("--chat", default=None, help="指定会话名，输出该会话最近消息")
+    w.add_argument("--limit", type=int, default=50)
+    w.add_argument("--json", action="store_true")
+    w.set_defaults(func=cmd_wechat)
 
     args = p.parse_args()
     if not getattr(args, "func", None):

@@ -17,6 +17,11 @@
       </div>
     </div>
 
+    <div class="seg app-seg" id="appSeg" title="切换信箱 / 微信统计">
+      <button data-app="mail" class="active">✉ 信箱</button>
+      <button data-app="wechat">💬 微信</button>
+    </div>
+
     <div class="search-wrap">
       <input class="input" id="search" type="search" placeholder="搜索主题 / 发件人 / 正文…（按 / 聚焦）" autocomplete="off">
       <select class="select" id="range">
@@ -38,7 +43,7 @@
     </div>
   </header>
 
-  <main class="layout">
+  <main class="layout" id="mailView">
     <aside class="sidebar">
       <div class="side-title">目录</div>
       <ul id="folders"></ul>
@@ -69,6 +74,21 @@
     <section class="reader" id="reader">
       <div class="empty">选择一封邮件开始阅读</div>
     </section>
+  </main>
+
+  <main class="wx" id="wxView" hidden>
+    <div class="wx-head">
+      <h2>微信统计</h2>
+      <select class="select" id="wxRange">
+        <option value="7" selected>最近 7 天</option>
+        <option value="30">最近 30 天</option>
+        <option value="90">最近 90 天</option>
+        <option value="0">全部时间</option>
+      </select>
+      <button class="btn" id="wxRefresh" title="忽略缓存重新扫描">刷新</button>
+      <span class="wx-meta" id="wxMeta"></span>
+    </div>
+    <div class="wx-body" id="wxBody"><div class="empty">加载中…</div></div>
   </main>
 </div>
 

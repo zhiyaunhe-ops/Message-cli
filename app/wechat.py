@@ -1,0 +1,498 @@
+"""微信数据接入 —— 复用 wechat-cli 的解密内核，产出可读的统计与摘要。
+
+wechat-cli 负责三件事：从微信进程内存提取数据库密钥（init）、把 SQLCipher 库解密到临时目录、
+按 `Msg_<md5(username)>` 分表查询消息。这里只复用它的解密与查询能力，聚合逻辑自己写，
+因为我们想要的是「跨全部会话的时间窗统计」，而 CLI 只有单会话 stats。
+
+依赖：pycryptodome / zstandard / click + wechat_cli 包（优先用已安装的，退回 source/ 源码树）。
+"""
+from __future__ import annotations
+
+import hashlib
+import os
+import re
+import sqlite3
+import sys
+import threading
+import time
+from collections import Counter
+from contextlib import closing
+from datetime import datetime, timedelta
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+SOURCE_DIR = ROOT / "source"
+
+TYPE_LABELS = {
+    1: "文本", 3: "图片", 34: "语音", 42: "名片",
+    43: "视频", 47: "表情", 48: "位置", 49: "链接/文件",
+    50: "通话", 10000: "系统", 10002: "撤回",
+}
+
+_TABLE_RE = re.compile(r"Msg_[0-9a-f]{32}")
+
+_lock = threading.Lock()
+_app = None            # wechat_cli AppContext（惰性创建，全局一份）
+_mods = None           # 导入的 wechat_cli 子模块集合
+_cache: dict = {}      # key -> (expire_ts, payload)
+CACHE_TTL = 300        # 统计结果缓存 5 分钟
+
+
+class WechatError(RuntimeError):
+    """微信数据不可用（未初始化 / 微信未运行 / 依赖缺失）。"""
+
+
+# ---------------------------------------------------------------- 基础设施
+
+def _load_mods():
+    """导入 wechat_cli 及其核心函数。优先已安装包，退回 source/ 源码树。"""
+    global _mods
+    if _mods is not None:
+        return _mods
+    try:
+        import wechat_cli  # noqa: F401
+    except ImportError:
+        if not SOURCE_DIR.exists():
+            raise WechatError(
+                "未找到 wechat_cli。请在 mailui 环境里 pip install -e source，"
+                "或确认 source/wechat_cli 源码树存在。"
+            )
+        sys.path.insert(0, str(SOURCE_DIR))
+        import wechat_cli  # noqa: F401
+
+    from wechat_cli.core.config import STATE_DIR, load_config
+    from wechat_cli.core.contacts import get_contact_names, get_self_username
+    from wechat_cli.core.context import AppContext
+    from wechat_cli.core.messages import (
+        _format_message_text,
+        _load_name2id_maps,
+        _resolve_sender_label,
+        decompress_content,
+        find_msg_db_keys,
+        format_msg_type,
+        resolve_chat_context,
+    )
+
+    _mods = {
+        "STATE_DIR": STATE_DIR,
+        "load_config": load_config,
+        "get_contact_names": get_contact_names,
+        "get_self_username": get_self_username,
+        "AppContext": AppContext,
+        "_format_message_text": _format_message_text,
+        "_load_name2id_maps": _load_name2id_maps,
+        "_resolve_sender_label": _resolve_sender_label,
+        "decompress_content": decompress_content,
+        "find_msg_db_keys": find_msg_db_keys,
+        "format_msg_type": format_msg_type,
+        "resolve_chat_context": resolve_chat_context,
+    }
+    return _mods
+
+
+def _app_ctx():
+    """惰性创建全局 AppContext（解密缓存跨请求复用）。"""
+    global _app
+    if _app is not None:
+        return _app
+    m = _load_mods()
+    cfg_path = os.environ.get("WECHAT_CLI_CONFIG") or None
+    try:
+        _app = m["AppContext"](cfg_path)
+    except FileNotFoundError as e:
+        raise WechatError(
+            f"{e}\n先运行（微信需保持登录）: wechat-cli init"
+        )
+    except Exception as e:
+        raise WechatError(f"微信数据初始化失败: {e}")
+    return _app
+
+
+def _cached(key, ttl=CACHE_TTL):
+    item = _cache.get(key)
+    if item and item[0] > time.time():
+        return item[1]
+    return None
+
+
+def _put(key, value, ttl=CACHE_TTL):
+    _cache[key] = (time.time() + ttl, value)
+    return value
+
+
+def invalidate():
+    _cache.clear()
+
+
+# ---------------------------------------------------------------- 状态
+
+def status() -> dict:
+    """微信数据可用性自检。"""
+    m = _load_mods()
+    state_dir = m["STATE_DIR"]
+    cfg_path = os.environ.get("WECHAT_CLI_CONFIG") or os.path.join(state_dir, "config.json")
+    keys_path = os.path.join(state_dir, "all_keys.json")
+    info = {
+        "ok": False,
+        "state_dir": state_dir,
+        "config_exists": os.path.exists(cfg_path),
+        "keys_exists": os.path.exists(keys_path),
+        "db_dir": None,
+        "msg_dbs": 0,
+        "error": None,
+    }
+    try:
+        app = _app_ctx()
+    except WechatError as e:
+        info["error"] = str(e)
+        return info
+    info["db_dir"] = app.db_dir
+    info["msg_dbs"] = len(app.msg_db_keys)
+    info["ok"] = bool(app.msg_db_keys)
+    if not info["ok"]:
+        info["error"] = "未找到消息数据库，请确认微信已登录并重新 wechat-cli init"
+    return info
+
+
+# ---------------------------------------------------------------- 时间窗
+
+def window(days: int | None) -> tuple[int | None, int | None]:
+    """最近 N 个自然日（含今天）的 [start_ts, end_ts]。days=None → 全部时间。"""
+    if not days:
+        return None, None
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    return int((today - timedelta(days=days - 1)).timestamp()), None
+
+
+def _range_label(start_ts, end_ts) -> str:
+    f = "%Y-%m-%d"
+    a = datetime.fromtimestamp(start_ts).strftime(f) if start_ts else "最早"
+    b = datetime.fromtimestamp(end_ts).strftime(f) if end_ts else "今天"
+    return f"{a} → {b}"
+
+
+# ---------------------------------------------------------------- 全局统计
+
+def _scan(start_ts: int | None, end_ts: int | None) -> dict:
+    """扫全部消息库，按时间窗聚合。单趟扫描，聚合在 Python 里做。"""
+    app = _app_ctx()
+    m = _load_mods()
+    names = m["get_contact_names"](app.cache, app.decrypted_dir)
+    self_user = m["get_self_username"](app.db_dir, app.cache, app.decrypted_dir)
+    disp = app.display_name_fn
+
+    total = 0
+    mine = 0
+    by_day: Counter = Counter()
+    by_hour: Counter = Counter()
+    by_type: Counter = Counter()
+    by_chat: Counter = Counter()      # username -> count
+    by_sender: Counter = Counter()    # username -> count
+    chat_group: dict = {}
+    first_ts = None
+    last_ts = None
+    dbs = 0
+    tables = 0
+
+    for rel in app.msg_db_keys:
+        path = app.cache.get(rel)
+        if not path:
+            continue
+        dbs += 1
+        try:
+            with closing(sqlite3.connect(path)) as conn:
+                id2u = m["_load_name2id_maps"](conn)
+                hash2u = {hashlib.md5(u.encode()).hexdigest(): u for u in set(id2u.values())}
+                tbl_names = [
+                    r[0] for r in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'"
+                    )
+                ]
+                where, params = [], []
+                if start_ts is not None:
+                    where.append("create_time >= ?")
+                    params.append(start_ts)
+                if end_ts is not None:
+                    where.append("create_time <= ?")
+                    params.append(end_ts)
+                wsql = f"WHERE {' AND '.join(where)}" if where else ""
+
+                for t in tbl_names:
+                    if not _TABLE_RE.fullmatch(t):
+                        continue
+                    tables += 1
+                    username = hash2u.get(t[4:], "")
+                    is_group = "@chatroom" in username
+                    if username:
+                        chat_group[username] = is_group
+                    try:
+                        rows = conn.execute(
+                            f"SELECT create_time, local_type, real_sender_id FROM [{t}] {wsql}",
+                            params,
+                        ).fetchall()
+                    except sqlite3.Error:
+                        continue
+                    for ts, lt, sid in rows:
+                        total += 1
+                        try:
+                            dt = datetime.fromtimestamp(ts)
+                        except (OSError, ValueError, OverflowError):
+                            continue
+                        by_day[dt.strftime("%Y-%m-%d")] += 1
+                        by_hour[dt.hour] += 1
+                        by_type[lt & 0xFFFFFFFF] += 1
+                        if username:
+                            by_chat[username] += 1
+                        su = id2u.get(sid) if sid else None
+                        if su:
+                            by_sender[su] += 1
+                            if su == self_user:
+                                mine += 1
+                        elif username and not is_group:
+                            # 单聊里自己发的消息 real_sender_id 通常为 0
+                            mine += 1
+                        if first_ts is None or ts < first_ts:
+                            first_ts = ts
+                        if last_ts is None or ts > last_ts:
+                            last_ts = ts
+        except Exception:
+            continue
+
+    def _dn(u: str) -> str:
+        try:
+            return disp(u, names) or u
+        except Exception:
+            return names.get(u, u)
+
+    top_chats = [
+        {
+            "username": u,
+            "chat": _dn(u),
+            "is_group": bool(chat_group.get(u)),
+            "count": c,
+            "pct": round(c / total * 100, 1) if total else 0.0,
+        }
+        for u, c in by_chat.most_common(60)
+    ]
+    top_senders = [
+        {"username": u, "name": _dn(u), "count": c}
+        for u, c in by_sender.most_common(15)
+    ]
+    group_cnt = sum(c for u, c in by_chat.items() if chat_group.get(u))
+    private_cnt = total - group_cnt
+
+    return {
+        "total": total,
+        "mine": mine,
+        "others": total - mine,
+        "chats": len(by_chat),
+        "group_chats": sum(1 for u in by_chat if chat_group.get(u)),
+        "private_chats": sum(1 for u in by_chat if not chat_group.get(u)),
+        "group_messages": group_cnt,
+        "private_messages": private_cnt,
+        "by_day": dict(sorted(by_day.items())),
+        "by_hour": {str(h): by_hour.get(h, 0) for h in range(24)},
+        "by_type": [
+            {"type": TYPE_LABELS.get(t, f"type={t}"), "count": c,
+             "pct": round(c / total * 100, 1) if total else 0.0}
+            for t, c in by_type.most_common()
+        ],
+        "top_chats": top_chats,
+        "top_senders": top_senders,
+        "scanned": {"databases": dbs, "tables": tables},
+        "first_ts": first_ts,
+        "last_ts": last_ts,
+    }
+
+
+def overview(days: int | None = 7, refresh: bool = False) -> dict:
+    """最近 N 天的全局统计（含未读数）。"""
+    start_ts, end_ts = window(days)
+    key = ("overview", days)
+    if not refresh:
+        hit = _cached(key)
+        if hit:
+            return hit
+
+    with _lock:
+        hit = _cached(key)
+        if hit and not refresh:
+            return hit
+        data = _scan(start_ts, end_ts)
+        data.update(
+            {
+                "days": days,
+                "range": _range_label(start_ts, end_ts),
+                "start_ts": start_ts,
+                "end_ts": end_ts,
+                "unread": unread_total(),
+                "generated_at": int(time.time()),
+            }
+        )
+        return _put(key, data)
+
+
+def unread_total() -> int:
+    """session.db 里所有会话的未读总数。"""
+    app = _app_ctx()
+    path = app.cache.get(os.path.join("session", "session.db"))
+    if not path:
+        return 0
+    try:
+        with closing(sqlite3.connect(path)) as conn:
+            row = conn.execute("SELECT COALESCE(SUM(unread_count), 0) FROM SessionTable").fetchone()
+            return int(row[0] or 0)
+    except sqlite3.Error:
+        return 0
+
+
+# ---------------------------------------------------------------- 会话
+
+def sessions(limit: int = 30) -> list[dict]:
+    """最近会话列表（与 wechat-cli sessions 一致）。"""
+    app = _app_ctx()
+    m = _load_mods()
+    names = m["get_contact_names"](app.cache, app.decrypted_dir)
+    path = app.cache.get(os.path.join("session", "session.db"))
+    if not path:
+        return []
+    out = []
+    with closing(sqlite3.connect(path)) as conn:
+        rows = conn.execute(
+            "SELECT username, unread_count, summary, last_timestamp, last_msg_type,"
+            "       last_msg_sender, last_sender_display_name"
+            "  FROM SessionTable WHERE last_timestamp > 0"
+            " ORDER BY last_timestamp DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    for username, unread, summary, ts, msg_type, sender, sender_name in rows:
+        is_group = "@chatroom" in username
+        if isinstance(summary, bytes):
+            summary = m["decompress_content"](summary, 4) or ""
+        if isinstance(summary, str) and ":\n" in summary:
+            summary = summary.split(":\n", 1)[1]
+        sender_disp = ""
+        if is_group and sender:
+            sender_disp = names.get(sender) or sender_name or sender
+        out.append(
+            {
+                "chat": names.get(username, username),
+                "username": username,
+                "is_group": is_group,
+                "unread": unread or 0,
+                "last_message": str(summary or ""),
+                "msg_type": m["format_msg_type"](msg_type),
+                "sender": sender_disp,
+                "timestamp": ts,
+                "time": datetime.fromtimestamp(ts).strftime("%m-%d %H:%M"),
+            }
+        )
+    return out
+
+
+def chat_history(chat: str, days: int | None = 7, limit: int = 50) -> dict:
+    """某个会话在时间窗内的最近消息（结构化）。"""
+    app = _app_ctx()
+    m = _load_mods()
+    ctx = m["resolve_chat_context"](chat, app.msg_db_keys, app.cache, app.decrypted_dir)
+    if not ctx:
+        raise WechatError(f"找不到聊天对象: {chat}")
+    if not ctx.get("db_path"):
+        return {"chat": ctx["display_name"], "username": ctx["username"],
+                "is_group": ctx["is_group"], "items": [], "total": 0}
+
+    names = m["get_contact_names"](app.cache, app.decrypted_dir)
+    disp = app.display_name_fn
+    start_ts, end_ts = window(days)
+    rows: list[tuple] = []
+    tables = ctx.get("message_tables") or [{"db_path": ctx["db_path"], "table_name": ctx["table_name"]}]
+    for t in tables:
+        tbl = t["table_name"]
+        if not _TABLE_RE.fullmatch(tbl):
+            continue
+        where, params = [], []
+        if start_ts is not None:
+            where.append("create_time >= ?")
+            params.append(start_ts)
+        if end_ts is not None:
+            where.append("create_time <= ?")
+            params.append(end_ts)
+        wsql = f"WHERE {' AND '.join(where)}" if where else ""
+        try:
+            with closing(sqlite3.connect(t["db_path"])) as conn:
+                id2u = m["_load_name2id_maps"](conn)
+                for r in conn.execute(
+                    f"SELECT local_id, local_type, create_time, real_sender_id, message_content,"
+                    f"       WCDB_CT_message_content FROM [{tbl}] {wsql}"
+                    f" ORDER BY create_time DESC LIMIT ?",
+                    (*params, max(limit * 3, 100)),
+                ).fetchall():
+                    rows.append((r, id2u))
+        except sqlite3.Error:
+            continue
+
+    rows.sort(key=lambda x: x[0][2], reverse=True)
+    rows = rows[:limit]
+    items = []
+    for (local_id, local_type, ts, sid, content, ct), id2u in rows:
+        text = m["decompress_content"](content, ct)
+        if text is None:
+            text = "(无法解压)"
+        _, body = m["_format_message_text"](
+            local_id, local_type, text, ctx["is_group"], ctx["username"],
+            ctx["display_name"], names, disp,
+        )
+        try:
+            who = m["_resolve_sender_label"](
+                sid, "", ctx["is_group"], ctx["username"], ctx["display_name"],
+                names, id2u, disp,
+            ) or ""
+        except Exception:
+            who = ""
+        items.append(
+            {
+                "id": local_id,
+                "time": datetime.fromtimestamp(ts).strftime("%m-%d %H:%M"),
+                "timestamp": ts,
+                "type": m["format_msg_type"](local_type),
+                "sender": who,
+                "text": (body or "")[:400],
+            }
+        )
+    return {
+        "chat": ctx["display_name"],
+        "username": ctx["username"],
+        "is_group": ctx["is_group"],
+        "days": days,
+        "range": _range_label(start_ts, end_ts),
+        "total": len(items),
+        "items": items,
+    }
+
+
+def chat_stats(chat: str, days: int | None = 7) -> dict:
+    """单会话统计：类型分布 / 发言排行 / 24 小时分布（复用 CLI 的聚合实现）。"""
+    from wechat_cli.core.messages import collect_chat_stats, _iter_table_contexts
+
+    app = _app_ctx()
+    m = _load_mods()
+    ctx = m["resolve_chat_context"](chat, app.msg_db_keys, app.cache, app.decrypted_dir)
+    if not ctx:
+        raise WechatError(f"找不到聊天对象: {chat}")
+    if not ctx.get("db_path"):
+        return {"chat": ctx["display_name"], "username": ctx["username"],
+                "is_group": ctx["is_group"], "total": 0}
+    names = m["get_contact_names"](app.cache, app.decrypted_dir)
+    start_ts, end_ts = window(days)
+    result = collect_chat_stats(ctx, names, app.display_name_fn, start_ts=start_ts, end_ts=end_ts)
+    result.update(
+        {
+            "chat": ctx["display_name"],
+            "username": ctx["username"],
+            "is_group": ctx["is_group"],
+            "days": days,
+            "range": _range_label(start_ts, end_ts),
+            "hourly": {str(h): result.get("hourly", {}).get(h, 0) for h in range(24)},
+        }
+    )
+    return result

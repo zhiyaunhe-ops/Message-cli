@@ -948,3 +948,119 @@ body {
   margin-top: 4px;
 }
 .compose-status { flex: 1; font-size: 11.5px; color: #d9534f; overflow-wrap: anywhere; }
+
+/* ============================================================
+   微信统计视图（新页签）
+   ============================================================ */
+.app-seg { flex: 0 0 auto; }
+body[data-app="wechat"] .search-wrap,
+body[data-app="wechat"] #composeBtn,
+body[data-app="wechat"] #unreadBtn,
+body[data-app="wechat"] #syncBtn { display: none; }
+
+.wx { flex: 1; display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+.wx-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 18px;
+  border-bottom: var(--border-w) solid var(--line);
+  background: var(--panel);
+  flex: 0 0 auto;
+}
+.wx-head h2 { margin: 0; font-size: 15px; font-weight: var(--weight-head); letter-spacing: var(--letter); }
+.wx-meta { font-size: 11.5px; color: var(--text-faint); margin-left: auto; }
+.wx-body { flex: 1; overflow-y: auto; padding: 16px 18px 40px; }
+
+.wx-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(148px, 1fr)); gap: 10px; margin-bottom: 14px; }
+.wx-card {
+  background: var(--panel);
+  border: var(--border-w) solid var(--line);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  box-shadow: var(--shadow-sm);
+}
+.wx-card .k { font-size: 11.5px; color: var(--text-faint); letter-spacing: 0.04em; }
+.wx-card .v { font-size: 24px; font-weight: var(--weight-head); margin-top: 4px; line-height: 1.1; }
+.wx-card .s { font-size: 11px; color: var(--text-dim); margin-top: 3px; }
+
+.wx-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; align-items: start; }
+@media (max-width: 1080px) { .wx-grid { grid-template-columns: 1fr; } }
+
+.wx-panel {
+  background: var(--panel);
+  border: var(--border-w) solid var(--line);
+  border-radius: var(--radius);
+  padding: 12px 14px 14px;
+  box-shadow: var(--shadow-sm);
+  margin-bottom: 12px;
+}
+.wx-panel h3 {
+  margin: 0 0 10px;
+  font-size: 12px; font-weight: var(--weight-head);
+  color: var(--text-dim);
+  letter-spacing: 0.06em;
+  text-transform: var(--caps);
+}
+.wx-panel h3 .sub { float: right; font-weight: 400; color: var(--text-faint); text-transform: none; letter-spacing: 0; }
+
+/* 柱状图 */
+.wx-bars { display: flex; align-items: flex-end; gap: 4px; height: 132px; }
+.wx-bar { flex: 1; display: flex; flex-direction: column; justify-content: flex-end; align-items: center; gap: 4px; min-width: 0; }
+.wx-bar .col {
+  width: 100%;
+  background: var(--accent);
+  opacity: 0.82;
+  border-radius: 2px 2px 0 0;
+  min-height: 2px;
+  transition: opacity 0.15s;
+}
+.wx-bar:hover .col { opacity: 1; }
+.wx-bar .lb { font-size: 10px; color: var(--text-faint); white-space: nowrap; overflow: hidden; max-width: 100%; }
+.wx-bar .vl { font-size: 10px; color: var(--text-dim); }
+
+/* 类型分布横条 */
+.wx-types { display: flex; flex-direction: column; gap: 7px; }
+.wx-type { display: grid; grid-template-columns: 64px 1fr 78px; align-items: center; gap: 8px; font-size: 12px; }
+.wx-type .n { color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wx-type .track { height: 8px; background: var(--panel-2); border: var(--border-w) solid var(--line); border-radius: 99px; overflow: hidden; }
+.wx-type .fill { height: 100%; background: var(--accent); opacity: 0.8; }
+.wx-type .c { text-align: right; color: var(--text-faint); font-variant-numeric: tabular-nums; }
+
+/* 会话排行 */
+.wx-rows { display: flex; flex-direction: column; }
+.wx-row {
+  display: grid; grid-template-columns: 26px 1fr auto;
+  gap: 9px; align-items: center;
+  padding: 7px 6px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 12.5px;
+}
+.wx-row:hover { background: var(--hover); }
+.wx-row.is-active { background: var(--selected); }
+.wx-row .rk { color: var(--text-faint); font-variant-numeric: tabular-nums; text-align: right; }
+.wx-row .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wx-row .nm i {
+  font-style: normal; font-size: 10px; color: var(--text-faint);
+  border: var(--border-w) solid var(--line); border-radius: 2px;
+  padding: 0 3px; margin-right: 5px;
+}
+.wx-row .ct { color: var(--text-dim); font-variant-numeric: tabular-nums; }
+.wx-row .bar { grid-column: 1 / -1; height: 3px; background: var(--panel-2); border-radius: 99px; overflow: hidden; margin-top: 4px; }
+.wx-row .bar i { display: block; height: 100%; background: var(--accent); opacity: 0.55; }
+
+.wx-row.is-plain { cursor: default; }
+.wx-row.is-plain:hover { background: transparent; }
+.wx-last { color: var(--text-faint); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wx-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); margin-right: 6px; vertical-align: 1px; }
+
+/* 会话详情 */
+.wx-detail { margin-top: 4px; }
+.wx-detail-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px; }
+.wx-detail-head b { font-size: 13.5px; }
+.wx-detail-head span { font-size: 11.5px; color: var(--text-faint); }
+.wx-msgs { display: flex; flex-direction: column; gap: 6px; max-height: 340px; overflow-y: auto; }
+.wx-msg { display: grid; grid-template-columns: 68px 1fr; gap: 8px; font-size: 12.5px; line-height: 1.55; }
+.wx-msg .t { color: var(--text-faint); font-variant-numeric: tabular-nums; }
+.wx-msg .b { min-width: 0; overflow-wrap: anywhere; }
+.wx-msg .b u { text-decoration: none; color: var(--accent); margin-right: 5px; }
+.wx-msg .b em { font-style: normal; color: var(--text-faint); }
