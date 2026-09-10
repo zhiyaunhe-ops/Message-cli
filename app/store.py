@@ -68,17 +68,55 @@ CREATE TABLE IF NOT EXISTS meta (
 
 
 class Store:
+    """SQLite 索引。
+
+    连接策略：**每线程一个连接**（thread-local），WAL 模式下多读单写；
+    写操作仍用一把全局锁串行化，避免 "database is locked" 竞争。
+    这样既不共享有状态连接，也不需要 check_same_thread 打补丁。
+    """
+
     def __init__(self, db_path: Path | str = DB_FILE):
         ensure_dirs()
         self.db_path = str(db_path)
-        self._lock = threading.RLock()
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=NORMAL")
-        self.conn.executescript(SCHEMA)
-        self.conn.commit()
-        self._migrate()
+        self._lock = threading.RLock()              # 写锁（沿用旧名，调用点不变）
+        self._local = threading.local()
+        self._conns: list[sqlite3.Connection] = []
+        self._conns_lock = threading.Lock()
+        with self._lock:                            # 建表 + 迁移走本线程连接
+            conn = self.conn
+            conn.executescript(SCHEMA)
+            conn.commit()
+            self._migrate()
+
+    # ---------- 连接 ----------
+    @property
+    def conn(self) -> sqlite3.Connection:
+        c = getattr(self._local, "conn", None)
+        if c is None:
+            c = sqlite3.connect(self.db_path, timeout=30)
+            c.row_factory = sqlite3.Row
+            c.execute("PRAGMA journal_mode=WAL")
+            c.execute("PRAGMA synchronous=NORMAL")
+            c.execute("PRAGMA busy_timeout=5000")
+            self._local.conn = c
+            with self._conns_lock:
+                self._conns.append(c)
+        return c
+
+    def close(self) -> None:
+        """关闭本进程内所有线程的连接（服务退出时调用）。"""
+        with self._conns_lock:
+            conns, self._conns = self._conns, []
+        for c in conns:
+            try:
+                c.close()
+            except Exception:
+                pass
+        if getattr(self._local, "conn", None) is not None:
+            try:
+                del self._local.conn
+            except Exception:
+                pass
 
     # ---------- 基础 ----------
     def _migrate(self) -> None:

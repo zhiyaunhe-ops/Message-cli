@@ -1,23 +1,21 @@
-"""统一运行上下文：一个服务，一套全局状态。
+"""统一运行上下文 —— 拆成几个内聚部件，而不是一个什么都管的上帝对象。
 
-这个进程里跑着两个模块：
-  · 邮件（IMAP/SMTP + 本地 SQLite 索引）
-  · 微信（本机数据库统计，只读）
+这个进程里跑着两个模块（邮件 / 微信），它们共享下面三块东西：
 
-它们共享这里的资源，而不是各管各的模块级变量：
-  account / store / imap 客户端   —— 惰性单例，线程安全
-  syncing / last_sync / log       —— 同步进度与运行日志
-  TTL 缓存                        —— 邮件派生数据与微信统计共用一套
-  wx_app                          —— 微信解密上下文（由 wechat 模块填充）
+    Cache        TTL 缓存（带 key 前缀，可按模块精确失效）
+    SyncState    同步进度、最近一次同步结果、运行日志
+    AppContext   资源工厂：账号 / SQLite Store / IMAP（按需创建、用后即关）/ 微信上下文
+                 + 写操作串行锁（同一时刻只允许一个 IMAP 写动作）
 
-用法：
-    from .context import ctx, account, store, client, own_emails, is_mine
+路由层通过 app/deps.py 的 Depends 拿到需要的部件；CLI / 服务层可以直接用 ctx。
 """
 from __future__ import annotations
 
 import threading
 import time
-from typing import Any
+from collections import OrderedDict
+from contextlib import contextmanager
+from typing import Any, Iterator
 
 from .imap_client import IMAPClient
 from .settings import Account, load_account
@@ -25,32 +23,100 @@ from .store import Store
 
 LOG_LIMIT = 300     # 运行日志最多保留多少条
 CACHE_TTL = 300     # 默认缓存 5 分钟
+CACHE_MAX = 256     # 缓存条目上限（超了淘汰最旧的）
 
 
+# ------------------------------------------------------------------ 缓存
+class TTLCache:
+    """带过期时间的小缓存；按插入顺序淘汰，避免无上限增长。"""
+
+    def __init__(self, ttl: float = CACHE_TTL, maxsize: int = CACHE_MAX) -> None:
+        self._lock = threading.RLock()
+        self._data: "OrderedDict[str, tuple[float, Any]]" = OrderedDict()
+        self.ttl = ttl
+        self.maxsize = maxsize
+
+    def get(self, key: str) -> Any | None:
+        with self._lock:
+            item = self._data.get(key)
+            if not item:
+                return None
+            if item[0] <= time.time():
+                self._data.pop(key, None)
+                return None
+            self._data.move_to_end(key)
+            return item[1]
+
+    def put(self, key: str, value: Any, ttl: float | None = None) -> Any:
+        with self._lock:
+            self._data[key] = (time.time() + (self.ttl if ttl is None else ttl), value)
+            self._data.move_to_end(key)
+            while len(self._data) > self.maxsize:
+                self._data.popitem(last=False)
+            return value
+
+    def invalidate(self, prefix: str | None = None) -> int:
+        with self._lock:
+            if prefix is None:
+                n = len(self._data)
+                self._data.clear()
+                return n
+            keys = [k for k in self._data if k.startswith(prefix)]
+            for k in keys:
+                self._data.pop(k, None)
+            return len(keys)
+
+    def keys(self) -> list[str]:
+        with self._lock:
+            return sorted(self._data)
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._data)
+
+
+# ------------------------------------------------------------------ 同步状态
+class SyncState:
+    """同步进度 + 运行日志（只负责状态，不碰 IO）。"""
+
+    def __init__(self, log_limit: int = LOG_LIMIT) -> None:
+        self._lock = threading.RLock()
+        self.syncing: bool = False
+        self.last_sync: dict | None = None
+        self._log: list[str] = []
+        self.log_limit = log_limit
+
+    def log_add(self, message: str) -> None:
+        with self._lock:
+            self._log.append(message)
+            if len(self._log) > self.log_limit:
+                del self._log[: len(self._log) - self.log_limit]
+
+    def recent_log(self, n: int = 50) -> list[str]:
+        with self._lock:
+            return self._log[-n:]
+
+    def clear_log(self) -> None:
+        with self._lock:
+            self._log.clear()
+
+
+# ------------------------------------------------------------------ 资源工厂
 class AppContext:
-    """进程内共享状态（单例由模块级 ctx 提供）。"""
+    """共享资源（账号 / 索引 / 邮件连接 / 微信上下文）+ 写锁。"""
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._account: Account | None = None
         self._store: Store | None = None
+        self._wx_app: Any = None
 
-        # 同步进度
-        self.syncing: bool = False
-        self.last_sync: dict | None = None
-        self.log: list[str] = []
+        self.cache = TTLCache()
+        self.sync = SyncState()
+        # IMAP 写操作（同步 / 发信 / 删除 / 标已读）串行化：一台服务器跑一个即可
+        self.write_lock = threading.RLock()
 
-        # TTL 缓存：key -> (过期时间戳, 值)
-        self._cache: dict[str, tuple[float, Any]] = {}
-
-        # 微信解密上下文（惰性创建，由 app/wechat.py 填充）
-        self.wx_app: Any = None
-
-    # ---------------------------------------------------------- 账号 / 索引
-    @property
-    def lock(self) -> threading.RLock:
-        return self._lock
-
+    # ---------------- 账号 / 索引 ----------------
     def account(self) -> Account:
         with self._lock:
             if self._account is None:
@@ -63,12 +129,8 @@ class AppContext:
                 self._store = Store()
             return self._store
 
-    def client(self) -> IMAPClient:
-        return IMAPClient(self.account())
-
     @property
     def own_emails(self) -> set[str]:
-        """自己的地址（判断一封邮件是「我发的」还是「别人发的」）。"""
         email = (self.account().email or "").strip().lower()
         return {email} if email else set()
 
@@ -78,59 +140,47 @@ class AppContext:
             return True
         return msg.get("folder") in ("Sent Items", "Drafts", "Sent", "已发送")
 
-    # ---------------------------------------------------------- 运行日志
-    def log_add(self, message: str) -> None:
-        with self._lock:
-            self.log.append(message)
-            if len(self.log) > LOG_LIMIT:
-                del self.log[: len(self.log) - LOG_LIMIT]
+    # ---------------- IMAP：按需创建、用后即关 ----------------
+    @contextmanager
+    def imap(self, timeout: int = 60) -> Iterator[IMAPClient]:
+        """每段逻辑用独立连接，出了 with 就关，避免共享有状态连接。"""
+        c = IMAPClient(self.account(), timeout=timeout)
+        try:
+            c.connect()
+            yield c
+        finally:
+            c.close()
 
-    def recent_log(self, n: int = 50) -> list[str]:
-        with self._lock:
-            return self.log[-n:]
+    @contextmanager
+    def imap_write(self) -> Iterator[IMAPClient]:
+        """写操作：独立连接 + 全局互斥（同一时刻只跑一个写动作）。"""
+        with self.write_lock, self.imap() as c:
+            yield c
 
-    # ---------------------------------------------------------- TTL 缓存
-    def cache_get(self, key: str) -> Any | None:
-        item = self._cache.get(key)
-        if item and item[0] > time.time():
-            return item[1]
-        return None
+    # ---------------- 微信解密上下文 ----------------
+    @property
+    def wx_app(self) -> Any:
+        return self._wx_app
 
-    def cache_put(self, key: str, value: Any, ttl: float = CACHE_TTL) -> Any:
-        self._cache[key] = (time.time() + ttl, value)
-        return value
+    @wx_app.setter
+    def wx_app(self, value: Any) -> None:
+        self._wx_app = value
 
-    def cache_invalidate(self, prefix: str | None = None) -> int:
-        """清缓存；给前缀则只清匹配的 key。返回清掉的条数。"""
-        with self._lock:
-            if prefix is None:
-                n = len(self._cache)
-                self._cache.clear()
-                return n
-            keys = [k for k in self._cache if k.startswith(prefix)]
-            for k in keys:
-                self._cache.pop(k, None)
-            return len(keys)
-
-    def cache_keys(self) -> list[str]:
-        return sorted(self._cache)
-
-    # ---------------------------------------------------------- 生命周期
-    def shutdown(self) -> None:
+    # ---------------- 生命周期 ----------------
+    def close(self) -> None:
         with self._lock:
             if self._store is not None:
-                try:
-                    self._store.conn.close()
-                except Exception:
-                    pass
+                self._store.close()
                 self._store = None
-            self.wx_app = None
-            self._cache.clear()
+            self._wx_app = None
+            self.cache.invalidate()
+            self.sync.clear_log()
 
 
 ctx = AppContext()
 
-# ---- 便捷函数（模块级，保持调用点简洁） ----
+
+# ------------------------------------------------------------------ 便捷函数
 def account() -> Account:
     return ctx.account()
 
@@ -139,8 +189,12 @@ def store() -> Store:
     return ctx.store()
 
 
-def client() -> IMAPClient:
-    return ctx.client()
+def imap() -> Any:
+    return ctx.imap()
+
+
+def imap_write() -> Any:
+    return ctx.imap_write()
 
 
 def own_emails() -> set[str]:
@@ -152,4 +206,4 @@ def is_mine(msg: dict) -> bool:
 
 
 def log_add(message: str) -> None:
-    ctx.log_add(message)
+    ctx.sync.log_add(message)

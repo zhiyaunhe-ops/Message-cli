@@ -10,14 +10,26 @@ import time
 from pathlib import Path
 from urllib.parse import quote
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from . import mailout
 from . import sync as syncmod
-from .classify import CATEGORY_EMOJI, CATEGORY_LABELS, classify, label as cat_label
-from .context import account, client, ctx, is_mine, own_emails, store
+from .classify import CATEGORY_EMOJI, CATEGORY_LABELS, label as cat_label
+from .context import AppContext, account, ctx, is_mine, own_emails, store
+from .deps import get_account, get_ctx, get_store
+from .services import (
+    att_url,
+    build_ai_inbox,
+    build_ai_threads,
+    reindex,
+    resolve_cids,
+    split_attachments,
+    truncate,
+)
+from .settings import Account
+from .store import Store
 from .threads import rebuild as rebuild_threads
 
 router = APIRouter(tags=["mail"])
@@ -32,23 +44,6 @@ def _enrich_categories(msg: dict) -> dict:
     msg["is_boring"] = bool(msg.get("is_boring"))
     msg["mine"] = is_mine(msg)
     return msg
-
-
-def reindex(classify_all: bool = False, rebuild: bool = True) -> dict:
-    """重建本地派生数据：分类 + 会话归组。"""
-    s = store()
-    out: dict = {}
-    if classify_all:
-        out["classified"] = s.classify_all(force=True)
-    else:
-        pending = s.conn.execute(
-            "SELECT COUNT(*) AS c FROM messages WHERE category='' OR category IS NULL"
-        ).fetchone()["c"]
-        out["classified"] = s.classify_all() if pending else {"scanned": 0}
-    if rebuild:
-        out["threads"] = rebuild_threads(s, own_emails=own_emails())
-    out["categories"] = s.category_stats()
-    return out
 
 
 @router.get("/api/ai/schema", summary="AI 接口自述：可直接照此调用")
@@ -106,59 +101,13 @@ def ai_schema():
     }
 
 
-# ---------------------------------------------------------------- 内嵌资源
-_CID_RE = re.compile(r"""(?i)(?:cid:|["']cid:)([^\s"'<>)\]]+)""")
-
-
-def att_url(folder: str, uid: int, index: int, disposition: str = "inline") -> str:
-    return f"/api/messages/{uid}/attachment/{index}?folder={quote(folder, safe='')}&disposition={disposition}"
-
-
-def resolve_cids(html: str, folder: str, uid: int, atts: list[dict]) -> str:
-    """把正文里的 cid: 引用替换成指向本地附件的 URL，让内嵌图片直接显示在正文中。"""
-    if not html or "cid:" not in html.lower():
-        return html
-    by_cid: dict[str, dict] = {}
-    for a in atts:
-        cid = (a.get("content_id") or "").strip().strip("<>")
-        if cid:
-            by_cid[cid.lower()] = a
-            by_cid[cid.split("@")[0].lower()] = a
-        if a.get("filename"):
-            by_cid[a["filename"].lower()] = a
-
-    def repl(m: re.Match) -> str:
-        cid = m.group(1).strip()
-        a = by_cid.get(cid.lower()) or by_cid.get(cid.split("@")[0].lower())
-        if not a:
-            return m.group(0)
-        return att_url(folder, uid, a["index"], "inline")
-
-    return _CID_RE.sub(repl, html)
-
-
-def split_attachments(atts: list[dict], folder: str, uid: int) -> tuple[list[dict], list[dict]]:
-    """拆成「真实附件」与「内嵌资源（签名 logo / 插图等，已渲染进正文）」。"""
-    real, inline = [], []
-    for a in atts:
-        item = {
-            "filename": a["filename"],
-            "content_type": a["content_type"],
-            "size": a["size"],
-            "is_inline": bool(a["is_inline"]),
-            "content_id": a.get("content_id") or "",
-            "url": att_url(folder, uid, a["index"], "attachment"),
-            "inline_url": att_url(folder, uid, a["index"], "inline"),
-        }
-        (inline if a["is_inline"] or a.get("content_id") else real).append(item)
-    return real, inline
-
-
 # ---------------------------------------------------------------- 状态
 @router.get("/api/status", summary="服务与索引状态")
-def status():
-    s = store()
-    acc = account()
+def status(
+    s: Store = Depends(get_store),
+    acc: Account = Depends(get_account),
+    app_ctx: AppContext = Depends(get_ctx),
+):
     folders = []
     for f in s.list_folders():
         c = s.folder_counts(f["name"])
@@ -183,10 +132,10 @@ def status():
         "categories": s.category_stats(),
         "threads": s.thread_stats(),
         "folders": folders,
-        "syncing": ctx.syncing,
-        "last_sync": ctx.last_sync,
-        "log": ctx.recent_log(20),
-        "cache_keys": ctx.cache_keys(),
+        "syncing": app_ctx.sync.syncing,
+        "last_sync": app_ctx.sync.last_sync,
+        "log": app_ctx.sync.recent_log(20),
+        "cache_keys": app_ctx.cache.keys(),
     }
 
 
@@ -211,10 +160,11 @@ def folders():
     s = store()
     known = {f["name"]: f for f in s.list_folders()}
     try:
-        remote = {f["name"]: f for f in client().list_folders()}
+        with ctx.imap() as c:
+            remote = {f["name"]: f for f in c.list_folders()}
     except Exception as e:
         remote = {}
-        ctx.log_add(f"list_folders failed: {e}")
+        ctx.sync.log_add(f"list_folders failed: {e}")
     out = []
     for name in sorted(set(known) | set(remote)):
         c = s.folder_counts(name)
@@ -245,38 +195,39 @@ class SyncRequest(BaseModel):
 
 @router.post("/api/sync", summary="增量同步 IMAP -> 本地索引")
 def do_sync(req: SyncRequest):
-    if ctx.syncing:
+    if ctx.sync.syncing:
         raise HTTPException(429, "同步正在进行中")
-    ctx.syncing = True
+    ctx.sync.syncing = True
     t0 = time.time()
     try:
-        c = client()
         s = store()
-        if req.all_folders or req.folder is None:
-            targets = [f["name"] for f in c.list_folders()]
-        elif isinstance(req.folder, str):
-            targets = [req.folder]
-        else:
-            targets = list(req.folder)
 
         def progress(folder: str, msg: str):
-            ctx.log_add(f"[{folder}] {msg}")
+            ctx.sync.log_add(f"[{folder}] {msg}")
 
-        results = [
-            syncmod.sync_folder(
-                c,
-                s,
-                f,
-                since=req.since,
-                envelope_limit=req.limit,
-                body_limit=req.body_limit,
-                force=req.force,
-                with_body=req.with_body,
-                progress=progress,
-            )
-            for f in targets
-        ]
-        ctx.last_sync = {"at": time.time(), "results": results}
+        # 写操作：独立连接 + 全局串行（同一时刻只跑一个 IMAP 写动作）
+        with ctx.imap_write() as c:
+            if req.all_folders or req.folder is None:
+                targets = [f["name"] for f in c.list_folders()]
+            elif isinstance(req.folder, str):
+                targets = [req.folder]
+            else:
+                targets = list(req.folder)
+            results = [
+                syncmod.sync_folder(
+                    c,
+                    s,
+                    f,
+                    since=req.since,
+                    envelope_limit=req.limit,
+                    body_limit=req.body_limit,
+                    force=req.force,
+                    with_body=req.with_body,
+                    progress=progress,
+                )
+                for f in targets
+            ]
+        ctx.sync.last_sync = {"at": time.time(), "results": results}
         return {
             "ok": True,
             "elapsed": round(time.time() - t0, 2),
@@ -288,7 +239,7 @@ def do_sync(req: SyncRequest):
     except Exception as e:
         raise HTTPException(500, f"同步失败: {e}")
     finally:
-        ctx.syncing = False
+        ctx.sync.syncing = False
 
 
 # ---------------------------------------------------------------- 邮件列表 / 详情
@@ -388,7 +339,8 @@ def set_flags(uid: int, req: FlagsRequest):
     if not msg:
         raise HTTPException(404, "邮件不存在")
     try:
-        flags = client().set_flags(uid, add=req.add, remove=req.remove, folder=req.folder)
+        with ctx.imap_write() as c:
+            flags = c.set_flags(uid, add=req.add, remove=req.remove, folder=req.folder)
         s.set_flags(req.folder, uid, flags)
     except Exception as e:
         raise HTTPException(500, f"设置标志失败: {e}")
@@ -402,7 +354,8 @@ def trash_message(uid: int, folder: str = "INBOX"):
     if not msg:
         raise HTTPException(404, f"未找到邮件 {folder}:{uid}")
     try:
-        r = client().move_to_trash(uid, folder)
+        with ctx.imap_write() as c:
+            r = c.move_to_trash(uid, folder)
     except Exception as e:
         raise HTTPException(500, f"删除失败: {e}")
     s.delete_message(folder, uid)  # 服务器已移走，本地索引同步清掉
@@ -471,15 +424,15 @@ def send_mail(
     sent_folder = acc.aliases.get("sent", "Sent Items")
     sent_uid = None
     try:
-        sent_uid = client().append_message(raw, sent_folder)
+        with ctx.imap_write() as c:
+            sent_uid = c.append_message(raw, sent_folder)
     except Exception as e:
-        ctx.log_add(f"append sent failed: {e}")
+        ctx.sync.log_add(f"append sent failed: {e}")
     try:
-        c = client()
-        syncmod.sync_folder(c, s, sent_folder, since=time.strftime("%Y-%m-%d"))
-        c.close()
+        with ctx.imap_write() as c:
+            syncmod.sync_folder(c, s, sent_folder, since=time.strftime("%Y-%m-%d"))
     except Exception as e:
-        ctx.log_add(f"sent sync failed: {e}")
+        ctx.sync.log_add(f"sent sync failed: {e}")
 
     return {
         "ok": True,
@@ -596,7 +549,7 @@ def get_thread(
         real, inline = split_attachments(atts, m["folder"], m["uid"])
         item = dict(m)
         if body_format in ("text", "both"):
-            item["body_text"] = _truncate(body["body_text"], body_chars)
+            item["body_text"] = truncate(body["body_text"], body_chars)
         if body_format in ("html", "both"):
             item["body_html"] = resolve_cids(body["body_html"], m["folder"], m["uid"], atts)
         item["attachments"] = real
@@ -630,12 +583,6 @@ def categories():
     return stats
 
 
-def _truncate(text: str, n: int) -> str:
-    if n <= 0 or not text or len(text) <= n:
-        return text or ""
-    return text[:n] + f"\n…（已截断，共 {len(text)} 字符，取全文请调用 /api/messages/{{uid}}）"
-
-
 @router.get("/api/ai/inbox", summary="AI 入口：结构化邮件列表（含清洗正文）")
 def ai_inbox(
     since: str | None = Query(default=DEFAULT_SINCE, examples=["2026-07-01"]),
@@ -653,89 +600,23 @@ def ai_inbox(
     boring: bool | None = Query(default=None, description="true=只要无聊邮件，false=排除无聊邮件"),
     order: str = "desc",
 ):
-    s = store()
-    if folder is None:
-        folders = ["INBOX"]
-    elif any(f.lower() == "all" for f in folder):
-        folders = None
-    else:
-        folders = list(folder)
-
-    total, items = s.list_messages(
-        folders=folders,
+    """路由只解析参数；逻辑在 services.build_ai_inbox（CLI 复用同一份）。"""
+    return build_ai_inbox(
         since=since,
         until=until,
+        folder=folder,
         q=q,
         unread_only=unread_only,
         has_attachment=has_attachment,
-        category=category,
-        boring=boring,
         limit=limit,
         offset=offset,
+        body_chars=body_chars,
+        include_html=include_html,
+        include_inline=include_inline,
+        category=category,
+        boring=boring,
         order=order,
     )
-    out = []
-    for m in items:
-        body = s.get_body(m["folder"], m["uid"])
-        atts = s.get_attachments(m["folder"], m["uid"])
-        real, inline = split_attachments(atts, m["folder"], m["uid"])
-        listed = real + inline if include_inline else real
-        item = {
-            "id": m["id"],
-            "folder": m["folder"],
-            "uid": m["uid"],
-            "date": m["date"],
-            "from": m["from"],
-            "to": m["to"],
-            "cc": m["cc"],
-            "subject": m["subject"],
-            "unread": m["unread"],
-            "flags": m["flags"],
-            "snippet": m["snippet"],
-            # 分类：personal=人工邮件，其余为「无聊邮件」
-            "category": m.get("category") or "personal",
-            "category_label": cat_label(m.get("category") or "personal"),
-            "is_boring": bool(m.get("is_boring")),
-            "mine": is_mine(m),
-            "thread_id": m.get("thread_id") or "",
-            "body_text": _truncate(body["body_text"], body_chars),
-            # 默认只列真实附件；内嵌图片已在正文里渲染，对 AI 也是噪声
-            "attachments": [
-                {
-                    "filename": a["filename"],
-                    "content_type": a["content_type"],
-                    "size": a["size"],
-                    "is_inline": a["is_inline"],
-                    "url": a["url"],
-                }
-                for a in listed
-            ],
-            "inline_count": len(inline),
-            "url": f"/api/messages/{m['uid']}?folder={m['folder']}",
-            "web_url": f"/?folder={m['folder']}&uid={m['uid']}",
-        }
-        if include_html:
-            item["body_html"] = resolve_cids(body["body_html"], m["folder"], m["uid"], atts)
-        out.append(item)
-
-    return {
-        "account": account().email,
-        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "query": {
-            "since": since,
-            "until": until,
-            "folder": folders or "all",
-            "q": q,
-            "unread_only": unread_only,
-            "limit": limit,
-            "offset": offset,
-            "body_chars": body_chars,
-        },
-        "total": total,
-        "count": len(out),
-        "next_offset": offset + len(out) if offset + len(out) < total else None,
-        "messages": out,
-    }
 
 
 @router.get("/api/ai/threads", summary="AI 入口：会话视图（同一来回聚合，聊天式输出）")
@@ -753,78 +634,21 @@ def ai_threads(
     body_chars: int = Query(default=1500, ge=0, le=200000),
     max_messages: int = Query(default=30, ge=1, le=200, description="单条会话最多返回多少封"),
 ):
-    s = store()
-    folders = None if not folder or any(f.lower() == "all" for f in folder) else list(folder)
-    _total, threads = s.list_threads(
-        folders=folders,
+    """路由只解析参数；逻辑在 services.build_ai_threads。"""
+    return build_ai_threads(
         since=since,
         until=until,
+        folder=folder,
         q=q,
         unread_only=unread_only,
-        boring=boring,
         category=category,
-        own_emails=own_emails(),
-        limit=1000000,
-        offset=0,
+        boring=boring,
+        only_grouped=only_grouped,
+        limit=limit,
+        offset=offset,
+        body_chars=body_chars,
+        max_messages=max_messages,
     )
-    out = []
-    for t in threads:
-        if only_grouped and t["message_count"] < 2:
-            continue
-        msgs = t["messages"][-max_messages:]
-        out.append(
-            {
-                "thread_id": t["thread_id"],
-                "subject": t["subject"],
-                "participants": [p["name"] or p["email"] for p in t["participants"]],
-                "message_count": t["message_count"],
-                "unread": t["unread"],
-                "first_date": t["first_date"],
-                "last_date": t["last_date"],
-                "folders": t["folders"],
-                "category": t["category"],
-                "category_label": cat_label(t["category"]),
-                "is_boring": t["is_boring"],
-                "attachment_count": t["attachment_count"],
-                "messages": [
-                    {
-                        "id": m["id"],
-                        "folder": m["folder"],
-                        "uid": m["uid"],
-                        "date": m["date"],
-                        "from": m["from"],
-                        "to": m["to"],
-                        "mine": is_mine(m),
-                        "unread": m["unread"],
-                        "body_text": _truncate(s.get_body(m["folder"], m["uid"])["body_text"], body_chars),
-                        "attachments": [
-                            {
-                                "filename": a["filename"],
-                                "size": a["size"],
-                                "url": att_url(m["folder"], m["uid"], a["index"], "attachment"),
-                            }
-                            for a in s.get_attachments(m["folder"], m["uid"])
-                            if not a["is_inline"]
-                        ],
-                        "url": f"/api/messages/{m['uid']}?folder={m['folder']}",
-                        "web_url": f"/?folder={m['folder']}&uid={m['uid']}",
-                    }
-                    for m in msgs
-                ],
-                "url": f"/api/threads/{t['thread_id']}",
-                "web_url": f"/?thread={t['thread_id']}",
-            }
-        )
-    out = out[offset : offset + limit]
-    return {
-        "account": account().email,
-        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "query": {"since": since, "until": until, "folder": folders or "all", "q": q,
-                  "boring": boring, "category": category, "only_grouped": only_grouped},
-        "total": _total if not only_grouped else len(out),
-        "count": len(out),
-        "threads": out,
-    }
 
 
 @router.get("/api/ai/digest", summary="AI 入口：按维度聚合统计")

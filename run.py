@@ -115,10 +115,10 @@ def cmd_verify(args):
 
 
 def cmd_ai(args):
-    """离线打印 AI 接口等价输出（不启动服务）。"""
-    from app.api_mail import ai_inbox  # 延迟导入，避免 uvicorn 依赖
+    """离线打印 AI 接口等价输出（不启动服务，直接调服务层）。"""
+    from app.services import build_ai_inbox  # 延迟导入，避免 uvicorn 依赖
 
-    data = ai_inbox(
+    data = build_ai_inbox(
         since=args.since,
         until=None,
         folder=["all"] if args.all_folders else (args.folder or None),
