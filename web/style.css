@@ -1430,7 +1430,7 @@ body[data-app="wechat"] #syncBtn { display: none; }
   .modal-foot .btn { flex: 1 1 auto; }
   .compose-status { flex: 1 1 100%; }
   .draft-status { flex: 1 1 100%; white-space: normal; }
-  .compose-row { gap: 7px; }
+  .compose-row { gap: 7px; flex-wrap: wrap; }
   .file-names { flex: 1 1 100%; }
 
   /* iOS Safari 会自动放大 <16px 的输入框，这里统一顶到 16px */
