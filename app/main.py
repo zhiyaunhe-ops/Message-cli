@@ -12,14 +12,15 @@
 """
 from __future__ import annotations
 
+import threading
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
+from .api_mail import modules_overview, remote_folders
 from .api_mail import router as mail_router
 from .api_wechat import router as wechat_router
 from .context import ctx
@@ -29,15 +30,34 @@ from .settings import ROOT
 WEB_DIR = ROOT / "web"
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """启动：把统一上下文挂到 app.state（供 Depends 注入），补分类与会话归组；
-    退出：关闭 SQLite 连接、清缓存。"""
-    app.state.ctx = ctx
+def _warmup() -> None:
+    """后台预热：重建派生索引（分类 / 会话归组）+ 预取目录清单 + 模块自检。
+
+    跑在独立线程里 —— uvicorn 一就绪就能响应请求，不用等这些做完，
+    重启后的第一次访问也就不再被拖住。
+    """
     try:
         reindex(classify_all=False, rebuild=True)
+    except Exception as e:
+        ctx.sync.log_add(f"startup reindex failed: {e}")
+    # /api/status 的微信自检要导入 wechat_cli 并打开本机微信库，进程内首次约 1s；
+    # 提前跑掉，让用户的第一次访问就是热路径。
+    try:
+        modules_overview()
     except Exception:
         pass
+    try:
+        remote_folders(refresh=True)   # 顺手把目录清单缓存填好
+    except Exception:
+        pass
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """启动：把统一上下文挂到 app.state（供 Depends 注入），后台线程做预热；
+    退出：关闭 SQLite 连接、清缓存。"""
+    app.state.ctx = ctx
+    threading.Thread(target=_warmup, name="warmup", daemon=True).start()
     yield
     ctx.close()
 
@@ -62,22 +82,46 @@ app.include_router(mail_router)
 app.include_router(wechat_router)
 
 # ---------------------------------------------------------------- 页面 / 静态
-class NoCacheStaticFiles(StaticFiles):
-    """静态资源要求浏览器每次用 ETag 协商（未变更返回 304），
-    避免 Chromium 启发式缓存把旧版 app.js/index.html 多缓存几个小时不更新。"""
+class VersionedStaticFiles(StaticFiles):
+    """静态资源缓存策略：
 
-    def file_response(self, *args, **kwargs):
-        resp = super().file_response(*args, **kwargs)
-        resp.headers["Cache-Control"] = "no-cache"
+    · 带 ?v=<版本号> —— 版本号取自文件 mtime，内容一变 URL 就变，
+      所以可以放心 immutable 长缓存，重复访问一个字节都不用传。
+    · 不带版本号 —— 退回 no-cache + ETag 协商（未变更返回 304），
+      避免 Chromium 启发式缓存把旧版 app.js/index.html 多缓存几个小时不更新。
+    """
+
+    async def get_response(self, path: str, scope):
+        resp = await super().get_response(path, scope)
+        if scope.get("query_string"):
+            resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        else:
+            resp.headers["Cache-Control"] = "no-cache"
         return resp
 
 
-app.mount("/static", NoCacheStaticFiles(directory=str(WEB_DIR)), name="static")
+app.mount("/static", VersionedStaticFiles(directory=str(WEB_DIR)), name="static")
+
+
+def _asset_version() -> str:
+    """静态资源版本号：app.js / style.css 的 mtime，改文件即自动换 URL。"""
+    stamps = []
+    for name in ("app.js", "style.css"):
+        try:
+            stamps.append(str(int((WEB_DIR / name).stat().st_mtime)))
+        except OSError:
+            stamps.append("0")
+    return "-".join(stamps)
 
 
 @app.get("/", include_in_schema=False)
 def index():
-    return FileResponse(WEB_DIR / "index.html", headers={"Cache-Control": "no-cache"})
+    """首页：给 app.js / style.css 打上版本号，让它们能走长缓存。"""
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    v = _asset_version()
+    html = html.replace("/static/style.css", f"/static/style.css?v={v}")
+    html = html.replace("/static/app.js", f"/static/app.js?v={v}")
+    return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/llms.txt", include_in_schema=False)

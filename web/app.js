@@ -173,12 +173,27 @@
     return map[name] || name;
   }
 
+  const LS_FOLDERS = "mail.folders.cache";
+
+  /** 先用上次的目录快照把侧栏画出来（秒开），网络回来后再覆盖 —— stale-while-revalidate。 */
+  function paintCachedFolders() {
+    try {
+      const arr = JSON.parse(localStorage.getItem(LS_FOLDERS) || "null");
+      if (Array.isArray(arr) && arr.length) {
+        state.folders = arr;
+        renderFolders();
+      }
+    } catch (e) {}
+  }
+
   async function loadFolders() {
     try {
       const data = await api("/api/folders");
       state.folders = data.folders || [];
+      try { localStorage.setItem(LS_FOLDERS, JSON.stringify(state.folders)); } catch (e) {}
     } catch (e) {
-      state.folders = [{ name: "INBOX", total: 0, unread: 0 }];
+      // 失败时保留本地快照，别把侧栏清空
+      if (!state.folders.length) state.folders = [{ name: "INBOX", total: 0, unread: 0 }];
     }
     renderFolders();
   }
@@ -1405,20 +1420,22 @@
       );
     }
 
-    loadFolders()
-      .then(() => loadCurrent(false))
-      .then(() => {
-        if (threadParam) {
-          const row = document.querySelector(`.thread-row[data-thread="${threadParam}"]`);
-          openThread(threadParam, row);
-        } else if (uidParam) {
-          const uid = parseInt(uidParam, 10);
-          if (!isNaN(uid)) {
-            const row = document.querySelector(`.msg-row[data-uid="${uid}"]`);
-            openMessage(state.folder, uid, row);
-          }
+    paintCachedFolders();   // 有本地快照就先画侧栏，不等网络
+
+    // 侧栏与列表并行发出：列表不再排队等目录清单（目录清单是最慢的一步）
+    const boot = Promise.all([loadFolders(), loadCurrent(false)]);
+    boot.then(() => {
+      if (threadParam) {
+        const row = document.querySelector(`.thread-row[data-thread="${threadParam}"]`);
+        openThread(threadParam, row);
+      } else if (uidParam) {
+        const uid = parseInt(uidParam, 10);
+        if (!isNaN(uid)) {
+          const row = document.querySelector(`.msg-row[data-uid="${uid}"]`);
+          openMessage(state.folder, uid, row);
         }
-      });
+      }
+    });
   }
 
   document.addEventListener("DOMContentLoaded", init);

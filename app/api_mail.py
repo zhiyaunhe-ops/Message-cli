@@ -124,7 +124,7 @@ def status(
     return {
         "ok": True,
         "service": "message-webui",
-        "modules": _modules_overview(),
+        "modules": modules_overview(),
         "account": {"name": acc.name, "email": acc.email, "display_name": acc.display_name},
         "imap": {"host": acc.imap_host, "port": acc.imap_port, "ssl": acc.imap_ssl},
         "smtp": {"host": acc.smtp_host, "port": acc.smtp_port, "ssl": acc.smtp_ssl},
@@ -139,9 +139,20 @@ def status(
     }
 
 
-def _modules_overview() -> dict:
-    """一个服务里的两个模块各自能不能用（微信依赖缺失也不影响邮件）。"""
-    out = {"mail": {"available": True}}
+MODULES_TTL = 60        # 微信可用性自检（要打开本机微信库）缓存秒数
+
+
+def modules_overview() -> dict:
+    """一个服务里的两个模块各自能不能用（微信依赖缺失也不影响邮件）。
+
+    微信自检要加载 wechat_cli 并打开本机微信数据库，冷启动实测 ~0.2s，且它由
+    /api/status 驱动 —— 每次开页面都会调。结果变化很慢（无非是微信开没开），
+    所以缓存一分钟。
+    """
+    hit = ctx.cache.get("mail:modules")
+    if hit is not None:
+        return hit
+    out: dict = {"mail": {"available": True}}
     try:
         from . import wechat as wx
 
@@ -152,34 +163,55 @@ def _modules_overview() -> dict:
         }
     except Exception as e:  # 依赖缺失 / 未 init / 微信没开
         out["wechat"] = {"available": False, "error": str(e)}
-    return out
+    return ctx.cache.put("mail:modules", out, ttl=MODULES_TTL)
 
 
-@router.get("/api/folders", summary="目录列表与计数")
-def folders():
-    s = store()
-    known = {f["name"]: f for f in s.list_folders()}
+CACHE_KEY_FOLDERS_REMOTE = "mail:folders:remote"
+FOLDERS_TTL = 300       # 远端目录清单缓存秒数
+
+
+def remote_folders(refresh: bool = False) -> dict:
+    """远端目录清单（IMAP LIST），带 TTL 缓存。
+
+    LIST 本身几乎不变，但每取一次都要 建 TLS 连接 + LOGIN + LIST —— 这是整页加载里
+    最慢的一步（冷启动实测 2.3s）。缓存命中时首屏只剩本地 SQLite 计数（毫秒级）。
+    回源失败时退回上一次快照，避免网络抖一下侧栏就变空。
+    """
+    if not refresh:
+        hit = ctx.cache.get(CACHE_KEY_FOLDERS_REMOTE)
+        if hit is not None:
+            return hit
     try:
         with ctx.imap() as c:
             remote = {f["name"]: f for f in c.list_folders()}
     except Exception as e:
-        remote = {}
         ctx.sync.log_add(f"list_folders failed: {e}")
+        return ctx.cache.get(CACHE_KEY_FOLDERS_REMOTE) or {}
+    if remote:
+        ctx.cache.put(CACHE_KEY_FOLDERS_REMOTE, remote, ttl=FOLDERS_TTL)
+    return remote
+
+
+@router.get("/api/folders", summary="目录列表与计数")
+def folders(refresh: bool = Query(False, description="跳过缓存，强制回源 IMAP 重取目录清单")):
+    s = store()
+    known = {f["name"]: f for f in s.list_folders()}
+    remote = remote_folders(refresh=refresh)
     out = []
     for name in sorted(set(known) | set(remote)):
-        c = s.folder_counts(name)
+        cnt = s.folder_counts(name)
         synced = name in known
         out.append(
             {
                 "name": name,
-                "total": c["total"],
-                "unread": c["unread"],
+                "total": cnt["total"],
+                "unread": cnt["unread"],
                 "synced": synced,
                 "last_synced": known[name]["last_synced"] if synced else 0,
                 "flags": remote.get(name, {}).get("flags", []),
             }
         )
-    return {"folders": out, "count": len(out)}
+    return {"folders": out, "count": len(out), "cached": not refresh and CACHE_KEY_FOLDERS_REMOTE in ctx.cache.keys()}
 
 
 # ---------------------------------------------------------------- 同步
@@ -207,8 +239,10 @@ def do_sync(req: SyncRequest):
 
         # 写操作：独立连接 + 全局串行（同一时刻只跑一个 IMAP 写动作）
         with ctx.imap_write() as c:
+            fresh: dict = {}
             if req.all_folders or req.folder is None:
-                targets = [f["name"] for f in c.list_folders()]
+                fresh = {f["name"]: f for f in c.list_folders()}
+                targets = list(fresh)
             elif isinstance(req.folder, str):
                 targets = [req.folder]
             else:
@@ -227,6 +261,9 @@ def do_sync(req: SyncRequest):
                 )
                 for f in targets
             ]
+        # 同步时顺手拿到的目录清单直接更新缓存，省掉 /api/folders 的一次回源
+        if fresh:
+            ctx.cache.put(CACHE_KEY_FOLDERS_REMOTE, fresh, ttl=FOLDERS_TTL)
         ctx.sync.last_sync = {"at": time.time(), "results": results}
         return {
             "ok": True,
