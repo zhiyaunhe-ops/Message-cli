@@ -57,6 +57,7 @@ eq(T.normAddrs([{ name: "王小明", email: "wang.xiaoming@example.com" }]), [{ 
 eq(T.normAddrs(""), [], "空串");
 eq(T.normAddrs(null), [], "null");
 
+/* 下面这些人名 / 域名全是 example.com 占位，不要换成真实往来联系人 */
 const inbound = {
   mine: false, folder: "INBOX",
   from: { name: "Alice Chen", email: "alice.chen@partner.example.com" },
@@ -70,7 +71,7 @@ eq(T.replyTargetOf(inbound), [{ name: "Alice Chen", email: "alice.chen@partner.e
 eq(T.replyAllTargets(inbound), {
   to: [{ name: "Alice Chen", email: "alice.chen@partner.example.com" }, { name: "Bob", email: "bob.li@partner.example.com" }],
   cc: [{ name: "Carol", email: "carol.wu@vendor.example.com" }],
-}, "回复全部=发件人+收件人；抄送去掉重复的 Lisa；自己不被带上");
+}, "回复全部=发件人+收件人；抄送去掉重复的 Bob；自己不被带上");
 
 const outbound = {
   mine: true, folder: "Sent Items",
@@ -90,7 +91,7 @@ eq(T.getLast().cc.length, 1, "cc 预填 1 人");
 eq(T.getLast().subject, "Re: HK air cargo", "已有 Re: 不重复加");
 eq(T.getLast().reply, { folder: "INBOX", uid: undefined }, "带 reply 头信息");
 
-const single = { mine: false, folder: "INBOX", from: { name: "Solo", email: "solo@x.com" },
+const single = { mine: false, folder: "INBOX", from: { name: "Solo", email: "solo@example.com" },
                  to: [{ email: "me@example.com" }], cc: [], subject: "hi" };
 console.log("[回复全部按钮置灰]");
 eq(T.replyAllBtn(single).disabled, true, "只有我一个收件人 -> 置灰");
