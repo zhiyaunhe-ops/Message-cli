@@ -13,7 +13,10 @@ jieba>=0.42                    # 关键词词云分词（未装则退回 CJK 二
 
 # 外部项目：wechat-cli（提供 wechat_cli 包，微信数据解密/查询内核）
 # 参考项目 / 已致谢：https://github.com/huohuoer/wechat-cli  (Apache-2.0)
-# wechat-cli @ git+https://github.com/huohuoer/wechat-cli
+# 注意：PyPI 上没有这个包，上游也没有任何 tag —— 必须按 commit SHA 从 GitHub 装。
+#       不要改用 main（上游一改代码，app/wechat.py 依赖的 wechat_cli.core.* 接口可能就对不上）。
+#   pip install "wechat-cli @ git+https://github.com/huohuoer/wechat-cli@a3789232d4f79bf0b30634d9dadbce71e4acd601"
+# 它自身只依赖 click / pycryptodome / zstandard（后两个上面已列）。
 
 # 开发可选
 # watchfiles>=0.21             # uvicorn --reload

@@ -15,8 +15,10 @@
 ## 启动
 
 ```bash
-# 1. 安装依赖（建议先建虚拟环境）
-pip install -r requirements.txt
+# 1. 建虚拟环境并安装依赖（.venv 已在 .gitignore 中）
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt          # Windows
+# python3 -m venv .venv && .venv/bin/pip install -r requirements.txt # macOS / Linux
 
 # 2. 配置邮箱：复制模板后填入自己的账号与密码
 cp config/himalaya/config.example.toml config/himalaya/config.toml
@@ -30,6 +32,9 @@ python run.py serve --host 127.0.0.1 --port 8765
 ```
 
 副命令：`sync` / `verify` / `ai` / `wechat` —— 见 `python run.py -h`。
+
+> 下文所有 `python` 都指项目内 `.venv` 的解释器：Windows 直接写 `.venv\Scripts\python.exe`，
+> macOS / Linux 先 `source .venv/bin/activate`。托盘/启动脚本会自动优先使用 `.venv`（见文末）。
 
 密码优先级：`MAIL_PASSWORD` 环境变量 > 配置里的 `password.command` > `config/himalaya/secret` 文件。
 真实的 `config.toml` 与 `secret` 都已 gitignore，仓库里只有 `.example` 模板。
@@ -68,7 +73,8 @@ WebUI 的「💬 微信」页签读的是本机微信（Weixin.exe）的加密�
 
 ```bash
 # 0. 安装外部项目 wechat-cli（提供 wechat_cli 包，见文末「参考项目」）
-pip install "wechat-cli @ git+https://github.com/huohuoer/wechat-cli"
+#    PyPI 上没有这个包，且上游没有 tag —— 按 commit SHA 锁定安装，别改用 main（会随上游漂移）
+pip install "wechat-cli @ git+https://github.com/huohuoer/wechat-cli@a3789232d4f79bf0b30634d9dadbce71e4acd601"
 
 # 1. 微信保持登录，提取数据库密钥（扫描进程内存，约 3 秒）
 wechat-cli init
@@ -161,8 +167,14 @@ Sent Items   17 封   正文 17   附件 29   日期 2026-07-08 → 2026-09-09
 | `MailWebUI.bat` | 同上，直接运行版 |
 
 脚本按以下顺序解析 Python 解释器：`$env:MAILUI_PYTHON` → `scripts\python.local.txt`
-→ 项目内 `.venv` → PATH 上的 `python`。把你的解释器路径写进 `scripts\python.local.txt`
-（参考 `python.local.example.txt`）即可，该文件已 gitignore。
+→ 项目内 `.venv` → PATH 上的 `python`。
+
+**默认走项目内 `.venv`**：只要按上面「启动」第 1 步建好 `.venv`，托盘与静默启动开箱即用，
+不需要任何额外配置。若想临时换解释器（比如另建了别的环境），把路径写进
+`scripts\python.local.txt`（参考 `python.local.example.txt`，已 gitignore），或设 `$env:MAILUI_PYTHON`。
+
+> 注意别让脚本落到「PATH 上的 python」：那可能是 Miniconda / 系统自带的解释器，里面没有
+> `fastapi`，托盘会静默启动失败（日志见 `data/server.err.log`）。
 
 ## 目录结构
 
