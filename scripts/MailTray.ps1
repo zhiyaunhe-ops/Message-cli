@@ -47,7 +47,13 @@ function Test-ServerApi {
 
 # ---------------- tray ----------------
 $icon = New-Object System.Windows.Forms.NotifyIcon
-$icon.Icon = [System.Drawing.SystemIcons]::Application
+# 应用图标：assets\mail-app.ico（水墨信封 + 朱砂印）；缺失时退回系统图标
+$iconPath = Join-Path $root "assets\mail-app.ico"
+if (Test-Path $iconPath) {
+    $icon.Icon = New-Object System.Drawing.Icon($iconPath, 16, 16)
+} else {
+    $icon.Icon = [System.Drawing.SystemIcons]::Application
+}
 $icon.Text = "Mail WebUI"
 $icon.Visible = $true
 
@@ -83,21 +89,16 @@ $miRestart.add_Click({
     Update-Status
 })
 
-$miStop = $menu.Items.Add("停止服务")
-$miStop.add_Click({
-    Stop-Server
-    $icon.ShowBalloonTip(3000, "Mail WebUI", "服务已停止", "Info")
-    Update-Status
-})
-
 $miLog = $menu.Items.Add("查看日志")
 $miLog.add_Click({ if (Test-Path $log) { Start-Process notepad.exe $log } })
 
 $menu.Items.Add("-") | Out-Null
 
-$miExit = $menu.Items.Add("退出托盘（服务保持运行）")
+# 退出 = 真正退出：停服务 + 移除托盘图标
+$miExit = $menu.Items.Add("退出（停止服务）")
 $miExit.add_Click({
     $timer.Stop()
+    Stop-Server
     $icon.Visible = $false
     $icon.Dispose()
     $context.ExitThread()
@@ -111,6 +112,9 @@ $icon.add_Click({
         Update-Status
     }
 })
+
+# 气泡被点击也打开信箱
+$icon.add_BalloonTipClicked({ Start-Process $url })
 
 function Update-Status {
     if (Get-ServerPid) {
@@ -132,10 +136,10 @@ $timer.Interval = 5000
 $timer.add_Tick({ Update-Status })
 $timer.Start()
 
-# 启动服务并显示气泡提示
-$started = Start-Server
+# 后台启动服务，然后常驻托盘
+Start-Server | Out-Null
 Update-Status
-$icon.ShowBalloonTip(4000, "Mail WebUI", "已启动 http://127.0.0.1:$port （左键图标打开，右键看菜单）", "Info")
+$icon.ShowBalloonTip(4000, "Mail WebUI", "已在后台运行（$url）`n左键图标打开信箱，右键可退出", "Info")
 
 $context = New-Object System.Windows.Forms.ApplicationContext
 [System.Windows.Forms.Application]::Run($context)

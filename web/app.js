@@ -210,6 +210,33 @@
     return state.viewMode === "thread" ? loadThreads(append) : loadMessages(append);
   }
 
+  // 空列表提示：目录其实有邮件但被当前筛选（时间范围/搜索/未读/分类）挡掉时，给出原因和一键解除
+  function renderEmptyList(kind) {
+    const list = $("#messageList");
+    const ftotal = (state.folders.find((f) => f.name === state.folder) || {}).total || 0;
+    let html = `<div class="empty">没有匹配的${kind}`;
+    if (ftotal > 0) {
+      const tips = [];
+      if (state.since !== "all")
+        tips.push('<a href="#" id="emptyAllLink">切换到全部时间</a>');
+      if (state.q) tips.push('<a href="#" id="emptyClearQ">清空搜索</a>');
+      if (state.unreadOnly) tips.push('<a href="#" id="emptyClearUnread">取消只看未读</a>');
+      if (state.category !== "all") tips.push('<a href="#" id="emptyClearCat">取消分类筛选</a>');
+      if (tips.length)
+        html += `<br><span class="empty-hint">该目录共有 ${ftotal} 封邮件，只是没命中当前筛选 — ${tips.join(" · ")}</span>`;
+    }
+    html += "</div>";
+    list.innerHTML = html;
+    const wire = (id, fn) => {
+      const a = $(id);
+      if (a) a.addEventListener("click", (e) => { e.preventDefault(); fn(); });
+    };
+    wire("#emptyAllLink", () => { $("#range").value = "all"; $("#range").dispatchEvent(new Event("change", { bubbles: true })); });
+    wire("#emptyClearQ", () => { $("#search").value = ""; state.q = ""; loadCurrent(false); });
+    wire("#emptyClearUnread", () => { $("#unreadBtn").click(); });
+    wire("#emptyClearCat", () => { $("#category").value = "all"; $("#category").dispatchEvent(new Event("change", { bubbles: true })); });
+  }
+
   /* ------------------------------ 列表 ------------------------------ */
   async function loadMessages(append) {
     const list = $("#messageList");
@@ -241,7 +268,7 @@
 
     list.innerHTML = "";
     if (!state.items.length) {
-      list.innerHTML = '<div class="empty">没有匹配的邮件</div>';
+      renderEmptyList("邮件");
       $("#listCount").textContent = "0 封";
       $("#moreBtn").style.display = "none";
       return;
@@ -614,7 +641,7 @@
 
     list.innerHTML = "";
     if (!state.items.length) {
-      list.innerHTML = '<div class="empty">没有匹配的会话</div>';
+      renderEmptyList("会话");
       $("#listCount").textContent = "0 条";
       $("#moreBtn").style.display = "none";
       return;
