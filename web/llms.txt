@@ -46,6 +46,21 @@
 - GET  /api/ai/schema                    机器可读的接口自述（与本文等价）
 - GET  /api/ai/verify?since=2026-07-01   校验时间窗内各目录数量、日期范围、附件数
 
+## 微信统计（本地微信数据，只读）
+
+依赖本机登录的微信 + wechat-cli 提取的数据库密钥（`~/.wechat-cli/`）。返回 `503` 表示微信数据不可用
+（未 init / 微信未登录 / 缺少 pycryptodome·zstandard 依赖）。
+
+- GET  /api/wechat/status                 可用性自检：数据目录、密钥文件、消息库数量
+- GET  /api/wechat/overview?days=7        全局统计：消息总数、群/单聊、每日量与 24 小时分布、类型分布、活跃会话 Top、未读；`days=0` 表示全部时间，`refresh=1` 忽略缓存重新扫描
+- GET  /api/wechat/sessions?limit=30      最近会话（含未读数与最后一条消息）
+- GET  /api/wechat/history?chat=名字&days=7&limit=50    某会话的最近消息（结构化）
+- GET  /api/wechat/stats?chat=名字&days=7 某会话统计：类型分布 / 发言排行 / 24 小时分布
+
+示例：
+
+    curl "http://127.0.0.1:8765/api/wechat/overview?days=7"
+
 ## 示例
 
 读取 2026 年 7 月 1 日以来全部邮件（正文截断 4000 字符）：
