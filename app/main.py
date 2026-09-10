@@ -20,9 +20,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
+from .api_ai import router as ai_router
 from .api_mail import modules_overview, remote_folders
 from .api_mail import router as mail_router
 from .api_wechat import router as wechat_router
+from .appconfig import ensure_example
 from .context import ctx
 from .services import reindex
 from .settings import ROOT
@@ -36,6 +38,10 @@ def _warmup() -> None:
     跑在独立线程里 —— uvicorn 一就绪就能响应请求，不用等这些做完，
     重启后的第一次访问也就不再被拖住。
     """
+    try:
+        ensure_example()          # 首次运行生成 config/app.example.toml
+    except Exception:
+        pass
     try:
         reindex(classify_all=False, rebuild=True)
     except Exception as e:
@@ -87,6 +93,7 @@ app.add_middleware(
 # ---------------------------------------------------------------- 路由装配
 app.include_router(mail_router)
 app.include_router(wechat_router)
+app.include_router(ai_router)
 
 # ---------------------------------------------------------------- 页面 / 静态
 class VersionedStaticFiles(StaticFiles):

@@ -77,12 +77,13 @@ def build_message(
     attachments: list[Attachment] | None = None,
     in_reply_to: str = "",
     references: str = "",
+    allow_empty_recipients: bool = False,
 ) -> EmailMessage:
     msg = EmailMessage()
     msg["From"] = formataddr_safe(acc.display_name or acc.email, acc.email)
     to_pairs = parse_addresses(to)
     cc_pairs = parse_addresses(cc)
-    if not to_pairs:
+    if not to_pairs and not allow_empty_recipients:
         raise MailOutError("收件人为空")
     msg["To"] = ", ".join(_format_addrs(to_pairs))
     if cc_pairs:

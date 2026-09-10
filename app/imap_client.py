@@ -225,6 +225,16 @@ class IMAPClient:
         conn.expunge()
         return {"ok": True, "uid": uid, "folder": folder, "trash": trash, "copied": copied}
 
+    def delete_message(self, uid: int, folder: str) -> dict:
+        """直接删掉（\\Deleted + EXPUNGE），不进回收站 —— 用来清理被新版本顶掉的草稿。"""
+        conn = self.connect()
+        self.select(folder, readonly=False)
+        typ, data = conn.uid("STORE", str(uid), "+FLAGS", "(\\Deleted)")
+        if typ != "OK":
+            raise RuntimeError(f"标记删除失败: {data}")
+        conn.expunge()
+        return {"ok": True, "uid": uid, "folder": folder}
+
     def append_message(self, raw: bytes, folder: str = "Sent Items", flags: str = "\\Seen") -> int:
         """把一封邮件（原始字节）APPEND 到服务器目录；返回服务器分配的 UID。"""
         conn = self.connect()

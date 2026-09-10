@@ -85,7 +85,14 @@ def ai_schema():
              "body": {"folder": "INBOX", "add": ["\\Seen"], "remove": []}},
             {"method": "DELETE", "path": f"{base}/messages/{{uid}}?folder=INBOX", "desc": "删除邮件（COPY 到回收站 + \\Deleted + EXPUNGE）"},
             {"method": "POST", "path": f"{base}/send", "desc": "发邮件（SMTP 465，multipart；可选附件；副本自动存回已发送）",
-             "fields": ["to(必填,逗号分隔)", "cc", "subject", "body", "reply_folder", "reply_uid", "files[]"]},
+             "fields": ["to(必填,逗号分隔)", "cc", "subject", "body", "reply_folder", "reply_uid", "draft_folder", "draft_uid", "files[]"]},
+            {"method": "POST", "path": f"{base}/drafts", "desc": "存草稿（APPEND 到草稿箱；带 draft_uid 时替换上一版，不堆积）",
+             "body": {"to": "", "cc": "", "subject": "", "body": "", "draft_folder": "", "draft_uid": 0}},
+            {"method": "POST", "path": f"{base}/compose/ai", "desc": "AI 生成正文：读收件人最近 N 封往来邮件 + 当前草稿，返回 3 个场景方案",
+             "body": {"to": "", "cc": "", "subject": "", "body": "", "recent": 10}},
+            {"method": "GET", "path": f"{base}/config/ai", "desc": "读 AI 配置（密钥打码；来源 config/app.toml）"},
+            {"method": "PUT", "path": f"{base}/config/ai", "desc": "改 AI 配置（base_url/api_key/model/temperature/timeout…）"},
+            {"method": "POST", "path": f"{base}/config/ai/test", "desc": "测试 AI 接口连通性"},
             {"method": "GET", "path": f"{base}/folders", "desc": "所有目录及计数 / 同步状态"},
             {"method": "POST", "path": f"{base}/sync", "desc": "从 IMAP 增量同步到本地索引",
              "body": {"folder": "INBOX", "since": DEFAULT_SINCE, "limit": 500, "force": False, "with_body": True}},
@@ -408,6 +415,8 @@ def send_mail(
     body: str = Form("", description="纯文本正文；直接换行即分段"),
     reply_folder: str = Form("", description="若为回复：原信所在目录"),
     reply_uid: int = Form(0, description="若为回复：原信 UID"),
+    draft_folder: str = Form("", description="若这封由草稿发出：草稿所在目录（发完自动清理）"),
+    draft_uid: int = Form(0, description="若这封由草稿发出：草稿 UID"),
     files: list[UploadFile] = File(default=[], description="附件，可多个"),
 ):
     acc = account()
@@ -471,13 +480,88 @@ def send_mail(
     except Exception as e:
         ctx.sync.log_add(f"sent sync failed: {e}")
 
+    # 已发出 -> 草稿箱里的那一版没用了，直接清掉（失败不影响发信结果）
+    draft_removed = False
+    if draft_uid:
+        try:
+            with ctx.imap_write() as c:
+                c.delete_message(draft_uid, draft_folder or acc.aliases.get("drafts", "Drafts"))
+            draft_removed = True
+        except Exception as e:
+            ctx.sync.log_add(f"draft cleanup failed: {e}")
+
     return {
         "ok": True,
         "message_id": result["message_id"],
         "accepted": result["accepted"],
         "sent_folder": sent_folder,
         "sent_uid": sent_uid,
+        "draft_removed": draft_removed,
         "web_url": f"/?folder={sent_folder}&uid={sent_uid}" if sent_uid else None,
+    }
+
+
+# ---------------------------------------------------------------- 草稿
+class DraftIn(BaseModel):
+    to: str = ""
+    cc: str = ""
+    subject: str = ""
+    body: str = ""
+    draft_folder: str = ""
+    draft_uid: int = 0          # 上一版草稿的 UID，有的话会被新版本顶掉
+
+
+@router.post("/api/drafts", summary="存草稿（APPEND 到草稿箱；带 draft_uid 则替换上一版）")
+def save_draft(d: DraftIn):
+    """写信界面边写边存：同一封草稿反复保存不会堆积，服务器上始终只留最新一版。"""
+    acc = account()
+    s = store()
+    folder = d.draft_folder or acc.aliases.get("drafts", "Drafts")
+    if not (d.to.strip() or d.cc.strip() or d.subject.strip() or d.body.strip()):
+        raise HTTPException(400, "草稿是空的，无需保存")
+
+    try:
+        msg = mailout.build_message(
+            acc, to=d.to, subject=d.subject, body_text=d.body, cc=d.cc,
+            allow_empty_recipients=True,
+        )
+    except mailout.MailOutError as e:
+        raise HTTPException(400, str(e))
+    raw = msg.as_bytes()
+
+    try:
+        with ctx.imap_write() as c:
+            uid = c.append_message(raw, folder, flags=r"(\Seen \Draft)")
+    except Exception as e:
+        raise HTTPException(500, f"草稿保存失败：{e}")
+
+    # APPEND 返回的 UID 是 uidnext-1 的推测值，同步后用 Message-ID 换回真实 UID
+    try:
+        with ctx.imap_write() as c:
+            syncmod.sync_folder(c, s, folder, since=time.strftime("%Y-%m-%d"))
+        row = s.conn.execute(
+            "SELECT uid FROM messages WHERE folder=? AND message_id=?", (folder, msg["Message-ID"])
+        ).fetchone()
+        if row:
+            uid = int(row["uid"])
+    except Exception as e:
+        ctx.sync.log_add(f"draft sync failed: {e}")
+
+    # 顶掉上一版草稿
+    if d.draft_uid and d.draft_uid != uid:
+        try:
+            with ctx.imap_write() as c:
+                c.delete_message(d.draft_uid, folder)
+            s.delete_message(folder, d.draft_uid)
+        except Exception as e:
+            ctx.sync.log_add(f"draft replace failed: {e}")
+
+    return {
+        "ok": True,
+        "uid": uid,
+        "folder": folder,
+        "saved_at": time.strftime("%H:%M:%S"),
+        "chars": len(d.body or ""),
     }
 
 

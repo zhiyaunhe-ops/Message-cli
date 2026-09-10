@@ -34,8 +34,13 @@
       hideOfficial: true, cat: "all", kwMine: "all", fold: 3,
     },
     // —— 写邮件 ——
-    compose: { reply: null },   // reply: {folder, uid} 表示这封是回复
+    // reply : {folder, uid} 表示这封是回复
+    // draft : {folder, uid} 服务器草稿箱里对应的那一版（自动保存时替换它，避免堆积）
+    // dirty : 内容被改过，需要落草稿；timer: 防抖句柄
+    compose: { reply: null, draft: null, dirty: false, timer: null, sending: false },
   };
+
+  const DRAFT_DEBOUNCE = 1800;  // 停止输入 1.8s 后自动存草稿
 
   const $ = (sel) => document.querySelector(sel);
   const el = (tag, cls, text) => {
@@ -120,10 +125,21 @@
     const res = await fetch(path, opts);
     if (!res.ok) {
       const txt = await res.text().catch(() => "");
-      throw new Error(`HTTP ${res.status} ${txt.slice(0, 160)}`);
+      let msg = txt.slice(0, 200);
+      try {
+        const j = JSON.parse(txt);            // FastAPI 的 {"detail": "..."} 比裸 JSON 好看
+        if (j && j.detail) msg = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail);
+      } catch (e) {}
+      throw new Error(msg || `HTTP ${res.status}`);
     }
     return res.json();
   }
+
+  const jsonPost = (url, data, opts) => api(url, Object.assign({
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  }, opts || {}));
 
   /* ------------------------------ 主题 ------------------------------ */
   function applyTheme(id) {
@@ -527,6 +543,18 @@
     extBtn.onclick = () => { state.showExternal = !state.showExternal; renderReader(m); };
     bar.appendChild(extBtn);
 
+    if (/draft|草稿/i.test(m.folder || "")) {   // 草稿箱里的邮件可以直接接着写
+      const editBtn = el("button", "btn btn-primary", "✏ 继续编辑");
+      editBtn.onclick = () => openCompose({
+        to: (m.to || []).map((t) => t.email || t.name || "").filter(Boolean).join(", "),
+        cc: (m.cc || []).map((t) => t.email || t.name || "").filter(Boolean).join(", "),
+        subject: m.subject || "",
+        body: m.body_text || "",
+        draft: { folder: m.folder, uid: m.uid },
+      });
+      bar.appendChild(editBtn);
+    }
+
     const replyBtn = el("button", "btn", "↩ 回复");
     replyBtn.onclick = () => openCompose({
       to: replyTargetOf(m),
@@ -895,22 +923,99 @@
 
   /* ------------------------------ 写邮件 / 删除 ------------------------------ */
 
+  function composeFields() {
+    return {
+      to: $("#cTo").value.trim(),
+      cc: $("#cCc").value.trim(),
+      subject: $("#cSubject").value.trim(),
+      body: $("#cBody").value,
+    };
+  }
+
+  function composeHasContent(f) {
+    return !!(f.to || f.cc || f.subject || (f.body || "").trim());
+  }
+
+  function setComposeStatus(text, ok) {
+    const s = $("#composeStatus");
+    s.textContent = text || "";
+    s.classList.toggle("is-ok", !!ok);
+  }
+
+  function setDraftStatus(text) { $("#draftStatus").textContent = text || ""; }
+
+  /* ---- 草稿自动保存：停止输入 1.8s 存一次；关窗/关页面立刻存 ---- */
+  function markComposeDirty() {
+    state.compose.dirty = true;
+    clearTimeout(state.compose.timer);
+    state.compose.timer = setTimeout(() => { saveDraft(); }, DRAFT_DEBOUNCE);
+  }
+
+  async function saveDraft(force) {
+    if (state.compose.sending) return null;   // 正在发送，别再存草稿（否则发完会剩一版）
+    const f = composeFields();
+    if (!composeHasContent(f)) return null;
+    if (!force && !state.compose.dirty) return state.compose.draft;
+    clearTimeout(state.compose.timer);
+    state.compose.dirty = false;
+    const d = state.compose.draft;
+    try {
+      const r = await jsonPost("/api/drafts", Object.assign({}, f, {
+        draft_folder: d ? d.folder : "",
+        draft_uid: d ? d.uid : 0,
+      }));
+      state.compose.draft = { folder: r.folder, uid: r.uid };
+      setDraftStatus(`草稿已存「${folderLabel(r.folder)}」 ${r.saved_at}`);
+      if (state.folder === r.folder && state.viewMode === "message") loadCurrent(false);
+      return state.compose.draft;
+    } catch (err) {
+      state.compose.dirty = true;   // 存失败就留着标记，下次再试
+      setDraftStatus("草稿保存失败：" + err.message);
+      return null;
+    }
+  }
+
+  function draftPayloadForBeacon() {
+    const f = composeFields();
+    const d = state.compose.draft;
+    return Object.assign({}, f, { draft_folder: d ? d.folder : "", draft_uid: d ? d.uid : 0 });
+  }
+
   function openCompose(prefill) {
     prefill = prefill || {};
+    clearTimeout(state.compose.timer);
     state.compose.reply = prefill.reply || null;
-    $("#composeTitle").textContent = state.compose.reply ? "回复邮件" : "写邮件";
+    state.compose.draft = prefill.draft || null;
+    state.compose.dirty = false;
+    state.compose.sending = false;
+    $("#composeTitle").textContent =
+      state.compose.reply ? "回复邮件" : (state.compose.draft ? "编辑草稿" : "写邮件");
     $("#cTo").value = prefill.to || "";
     $("#cCc").value = prefill.cc || "";
     $("#cSubject").value = prefill.subject || "";
     $("#cBody").value = prefill.body || "";
     $("#cFiles").value = "";
     $("#cFileNames").textContent = "";
-    $("#composeStatus").textContent = "";
+    setComposeStatus("");
+    setDraftStatus(state.compose.draft ? `正在编辑草稿箱里的这一版（保存会覆盖它）` : "");
+    $("#aiOpts").hidden = true;
+    $("#aiOpts").innerHTML = "";
     $("#composeModal").hidden = false;
     setTimeout(() => $("#cTo").focus(), 60);
   }
 
-  function closeCompose() { $("#composeModal").hidden = true; }
+  /** 关窗：先把没存的内容落进草稿箱，再收起 —— 误关/拖选误关都不会丢内容。 */
+  function closeCompose() {
+    const f = composeFields();
+    if (state.compose.dirty && composeHasContent(f)) {
+      saveDraft(true).then((d) => {
+        if (d) toast(`已存入「${folderLabel(d.folder)}」`, 2600);
+      });
+    }
+    clearTimeout(state.compose.timer);
+    $("#aiOpts").hidden = true;
+    $("#composeModal").hidden = true;
+  }
 
   function replyTargetOf(m) {
     // 回复对象：自己发的信 -> 回给收件人；别人发的 -> 回给发件人
@@ -919,36 +1024,186 @@
       : ((m.from || {}).email || "");
   }
 
+  /* ------------------------------ AI 写正文 ------------------------------ */
+
+  function renderAIOptions(r) {
+    const box = $("#aiOpts");
+    box.innerHTML = "";
+    box.hidden = false;
+    box.appendChild(el("div", "ai-opts-head",
+      `AI 建议 · ${r.model} · ${r.elapsed}s · 参考了 ${r.context.count} 封与收件人的往来邮件`));
+    (r.options || []).forEach((o, i) => {
+      const card = el("div", "ai-opt");
+      card.appendChild(el("div", "ai-opt-title", o.title || `方案 ${i + 1}`));
+      card.appendChild(el("div", "ai-opt-body", o.body || ""));
+      const use = el("button", "btn btn-primary btn-sm", "用这份");
+      use.type = "button";
+      use.onclick = () => {
+        $("#cBody").value = o.body || "";
+        box.hidden = true;
+        markComposeDirty();
+        toast(`已套用「${o.title || "方案 " + (i + 1)}」`, 2400);
+      };
+      card.appendChild(use);
+      box.appendChild(card);
+    });
+    const fold = el("button", "btn btn-sm", "收起");
+    fold.type = "button";
+    fold.onclick = () => { box.hidden = true; };
+    box.appendChild(fold);
+  }
+
+  async function aiGenerate() {
+    const btn = $("#aiBtn");
+    const f = composeFields();
+    if (!composeHasContent(f)) {
+      setComposeStatus("先填收件人或写点内容，AI 才有东西可参考");
+      return;
+    }
+    btn.disabled = true;
+    const label = btn.textContent;
+    btn.textContent = "生成中…";
+    setComposeStatus("正在读取往来邮件并调用 AI，可能要十几秒…");
+    try {
+      const cfg = await api("/api/config/ai");
+      if (!cfg.config.usable) {
+        setComposeStatus("AI 还没配好，请在设置里填接口地址 / 密钥 / 模型");
+        openSettings("需要先配置 AI 接口才能生成正文");
+        return;
+      }
+      const r = await jsonPost("/api/compose/ai", {
+        to: f.to, cc: f.cc, subject: f.subject, body: f.body,
+      });
+      renderAIOptions(r);
+      setComposeStatus(`生成完成，挑一份合适的即可`, true);
+    } catch (err) {
+      setComposeStatus("AI 生成失败：" + err.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = label;
+    }
+  }
+
+  /* ------------------------------ 设置（AI 接口） ------------------------------ */
+
+  async function openSettings(hint) {
+    try {
+      const r = await api("/api/config/ai");
+      const c = r.config;
+      $("#cfgEnabled").checked = !!c.enabled;
+      $("#cfgBaseUrl").value = c.base_url || "";
+      $("#cfgModel").value = c.model || "";
+      $("#cfgApiKey").value = "";
+      $("#cfgApiKey").placeholder = c.has_key ? `已保存 ${c.key_hint}（留空不修改）` : "粘贴你的 API Key";
+      $("#cfgTemp").value = c.temperature;
+      $("#cfgTimeout").value = c.timeout;
+      $("#cfgRecent").value = c.recent_count;
+      $("#cfgCtxChars").value = c.context_chars;
+      $("#settingsMeta").textContent =
+        `配置文件：${r.file}` +
+        (c.source === "env" ? " · 注意：环境变量 AI_* 覆盖了这里的设置" : "") +
+        (c.usable ? "" : " · 当前不可用");
+    } catch (err) {
+      $("#settingsStatus").textContent = "配置读取失败：" + err.message;
+    }
+    $("#settingsStatus").textContent = hint || "";
+    $("#settingsModal").hidden = false;
+  }
+
+  function closeSettings() { $("#settingsModal").hidden = true; }
+
+  function settingsPayload() {
+    const p = {
+      enabled: $("#cfgEnabled").checked,
+      base_url: $("#cfgBaseUrl").value.trim(),
+      model: $("#cfgModel").value.trim(),
+      temperature: parseFloat($("#cfgTemp").value) || 0.7,
+      timeout: parseInt($("#cfgTimeout").value, 10) || 60,
+      recent_count: parseInt($("#cfgRecent").value, 10) || 10,
+      context_chars: parseInt($("#cfgCtxChars").value, 10) || 1200,
+    };
+    const key = $("#cfgApiKey").value.trim();
+    if (key) p.api_key = key;      // 空 = 保留原密钥
+    return p;
+  }
+
+  async function submitSettings(e) {
+    e.preventDefault();
+    const st = $("#settingsStatus");
+    st.classList.remove("is-ok");
+    try {
+      const r = await jsonPost("/api/config/ai", settingsPayload(), { method: "PUT" });
+      $("#cfgApiKey").value = "";
+      $("#cfgApiKey").placeholder = r.config.has_key ? `已保存 ${r.config.key_hint}（留空不修改）` : "粘贴你的 API Key";
+      st.textContent = "✓ 已保存到 config/app.toml，立即生效";
+      st.classList.add("is-ok");
+      toast("AI 配置已保存");
+    } catch (err) {
+      st.textContent = "保存失败：" + err.message;
+    }
+  }
+
+  async function testSettings() {
+    const btn = $("#cfgTest");
+    const st = $("#settingsStatus");
+    btn.disabled = true;
+    const label = btn.textContent;
+    btn.textContent = "测试中…";
+    try {
+      await jsonPost("/api/config/ai", settingsPayload(), { method: "PUT" });  // 先落盘再测
+      const r = await jsonPost("/api/config/ai/test", {});
+      st.textContent = `✓ 连通正常（${r.model}，${r.elapsed}s，返回「${r.reply}」）`;
+      st.classList.add("is-ok");
+    } catch (err) {
+      st.classList.remove("is-ok");
+      st.textContent = "测试失败：" + err.message;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = label;
+    }
+  }
+
   async function submitCompose(e) {
     e.preventDefault();
     const btn = $("#sendBtn");
     const status = $("#composeStatus");
+    state.compose.sending = true;
+    clearTimeout(state.compose.timer);   // 别让待触发的自动保存插在发送中间
     btn.disabled = true;
     btn.textContent = "发送中…";
-    status.textContent = "";
+    setComposeStatus("");
     try {
       const fd = new FormData();
-      fd.set("to", $("#cTo").value.trim());
-      fd.set("cc", $("#cCc").value.trim());
-      fd.set("subject", $("#cSubject").value.trim());
-      fd.set("body", $("#cBody").value);
+      const f = composeFields();
+      fd.set("to", f.to);
+      fd.set("cc", f.cc);
+      fd.set("subject", f.subject);
+      fd.set("body", f.body);
       if (state.compose.reply) {
         fd.set("reply_folder", state.compose.reply.folder);
         fd.set("reply_uid", String(state.compose.reply.uid));
       }
-      for (const f of $("#cFiles").files) fd.append("files", f, f.name);
+      if (state.compose.draft) {   // 发完顺手把草稿箱里的那一版清掉
+        fd.set("draft_folder", state.compose.draft.folder);
+        fd.set("draft_uid", String(state.compose.draft.uid));
+      }
+      for (const file of $("#cFiles").files) fd.append("files", file, file.name);
       const r = await api("/api/send", { method: "POST", body: fd });
       toast(
         `✓ 已发送至 ${r.accepted.join("、")}` +
         (r.sent_uid ? `（副本已存「${folderLabel(r.sent_folder)}」）` : ""),
         4200
       );
+      clearTimeout(state.compose.timer);
+      state.compose.dirty = false;
+      state.compose.draft = null;
       closeCompose();
       loadFolders();
       if (state.folder === r.sent_folder) loadCurrent(false);
     } catch (err) {
       status.textContent = "发送失败：" + err.message;
     } finally {
+      state.compose.sending = false;
       btn.disabled = false;
       btn.textContent = "发送 ➤";
     }
@@ -1061,8 +1316,45 @@
     $("#composeBtn").addEventListener("click", () => openCompose());
     $("#composeClose").addEventListener("click", closeCompose);
     $("#composeCancel").addEventListener("click", closeCompose);
-    $("#composeModal").addEventListener("click", (e) => { if (e.target.id === "composeModal") closeCompose(); });
+    bindMaskClose("#composeModal", closeCompose);   // 只在遮罩上按下并抬起才关
     $("#composeForm").addEventListener("submit", submitCompose);
+
+    // 正文里拖选多行时，mouseup 会落到遮罩上 —— 这不是「点遮罩关闭」，所以用
+    // mousedown/mouseup 同源判断；否则编辑到一半的窗口会被拖没了。
+    function bindMaskClose(sel, onClose) {
+      const mask = $(sel);
+      let downOnMask = false;
+      mask.addEventListener("mousedown", (e) => { downOnMask = e.target === mask; });
+      mask.addEventListener("mouseup", (e) => {
+        if (downOnMask && e.target === mask) onClose();
+        downOnMask = false;
+      });
+    }
+
+    ["#cTo", "#cCc", "#cSubject", "#cBody"].forEach((sel) => {
+      $(sel).addEventListener("input", markComposeDirty);
+    });
+    $("#aiBtn").addEventListener("click", aiGenerate);
+
+    // 设置
+    $("#settingsBtn").addEventListener("click", () => openSettings());
+    $("#settingsClose").addEventListener("click", closeSettings);
+    $("#settingsCancel").addEventListener("click", closeSettings);
+    bindMaskClose("#settingsModal", closeSettings);
+    $("#settingsForm").addEventListener("submit", submitSettings);
+    $("#cfgTest").addEventListener("click", testSettings);
+
+    // 关页面/刷新时，把还在写的内容用 sendBeacon 存进草稿箱
+    window.addEventListener("beforeunload", () => {
+      if ($("#composeModal").hidden || !state.compose.dirty) return;
+      const f = composeFields();
+      if (!composeHasContent(f)) return;
+      try {
+        navigator.sendBeacon("/api/drafts",
+          new Blob([JSON.stringify(draftPayloadForBeacon())], { type: "application/json" }));
+      } catch (e) {}
+    });
+
     $("#cFiles").addEventListener("change", (e) => {
       const fs = [...e.target.files];
       $("#cFileNames").textContent = fs.length ? `已选 ${fs.length} 个：${fs.map((f) => f.name).join("、")}` : "";
@@ -1105,6 +1397,7 @@
     document.addEventListener("keydown", (e) => {
       const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName);
       if (e.key === "Escape" && !$("#composeModal").hidden) { closeCompose(); return; }
+      if (e.key === "Escape" && !$("#settingsModal").hidden) { closeSettings(); return; }
       if (e.key === "/" && !typing) { e.preventDefault(); $("#search").focus(); return; }
       if (typing) return;
       if (e.key === "j" || e.key === "ArrowDown" || e.key === "k" || e.key === "ArrowUp") {

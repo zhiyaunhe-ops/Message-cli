@@ -37,6 +37,7 @@
       <button class="btn" id="composeBtn" title="写一封新邮件">✏ 写邮件</button>
       <button class="btn" id="unreadBtn" title="只看未读">未读</button>
       <button class="btn btn-primary" id="syncBtn">同步</button>
+      <button class="btn" id="settingsBtn" title="设置 · AI 接口配置">⚙</button>
       <div class="theme-picker">
         <button class="btn" id="themeBtn">主题 · <span id="themeName">宣纸水墨</span> ▾</button>
         <div class="theme-menu" id="themeMenu"></div>
@@ -108,14 +109,57 @@
       <input class="input" id="cCc" placeholder="抄送（可选）" autocomplete="off">
       <input class="input" id="cSubject" placeholder="主题" autocomplete="off">
       <textarea class="input" id="cBody" rows="11" placeholder="正文…"></textarea>
+      <div class="ai-opts" id="aiOpts" hidden></div>
       <div class="compose-row">
         <label class="file-btn">📎 添加附件<input id="cFiles" type="file" multiple hidden></label>
+        <button type="button" class="btn btn-ai" id="aiBtn"
+                title="读取与收件人的最近往来邮件 + 当前标题正文，让 AI 给出 3 个场景的正文">✨ AI 写正文</button>
         <span class="file-names" id="cFileNames"></span>
       </div>
       <div class="modal-foot">
         <span class="compose-status" id="composeStatus"></span>
+        <span class="draft-status" id="draftStatus"></span>
         <button type="button" class="btn" id="composeCancel">取消</button>
         <button type="submit" class="btn btn-primary" id="sendBtn">发送 ➤</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="modal-mask" id="settingsModal" hidden>
+  <div class="modal">
+    <div class="modal-head">
+      <h3>设置 · AI 接口</h3>
+      <button class="modal-close" id="settingsClose" title="关闭">×</button>
+    </div>
+    <form id="settingsForm">
+      <p class="settings-hint">
+        共同配置存放于 <code>config/app.toml</code>（已 gitignore，不会入库），改完立即生效。<br>
+        任何 OpenAI 兼容接口都能用：OpenAI / DeepSeek / 通义 / Kimi / 本地 Ollama 的 <code>/v1</code>。
+      </p>
+      <label class="field"><span>接口地址 base_url</span>
+        <input class="input" id="cfgBaseUrl" placeholder="https://api.openai.com/v1" autocomplete="off"></label>
+      <label class="field"><span>API Key</span>
+        <input class="input" id="cfgApiKey" type="password" placeholder="留空表示不修改已保存的密钥" autocomplete="new-password"></label>
+      <label class="field"><span>模型 model</span>
+        <input class="input" id="cfgModel" placeholder="gpt-4o-mini" autocomplete="off"></label>
+      <div class="field-grid">
+        <label class="field"><span>温度</span>
+          <input class="input" id="cfgTemp" type="number" step="0.1" min="0" max="2"></label>
+        <label class="field"><span>超时（秒）</span>
+          <input class="input" id="cfgTimeout" type="number" min="5" max="300"></label>
+        <label class="field"><span>参考邮件数</span>
+          <input class="input" id="cfgRecent" type="number" min="1" max="30"></label>
+        <label class="field"><span>单封截断（字）</span>
+          <input class="input" id="cfgCtxChars" type="number" min="200" max="6000"></label>
+      </div>
+      <label class="switch"><input type="checkbox" id="cfgEnabled"><span>启用 AI 写正文</span></label>
+      <div class="settings-meta" id="settingsMeta"></div>
+      <div class="modal-foot">
+        <span class="compose-status" id="settingsStatus"></span>
+        <button type="button" class="btn" id="cfgTest" title="先保存当前填写的内容，再发一条最小请求验证连通性">测试连接</button>
+        <button type="button" class="btn" id="settingsCancel">取消</button>
+        <button type="submit" class="btn btn-primary">保存</button>
       </div>
     </form>
   </div>

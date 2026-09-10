@@ -36,7 +36,12 @@
 - GET  /api/messages/{uid}/attachment/{index}   下载附件
 - POST /api/messages/{uid}/flags         改标志；body: {folder, add:["\\Seen"], remove:[]}
 - DELETE /api/messages/{uid}?folder=...  删除邮件：COPY 到回收站 + \Deleted + EXPUNGE，本地索引同步清除
-- POST /api/send                         发邮件（SMTP，multipart/form-data）：to(必填)/cc/subject/body/reply_folder/reply_uid/files[]；副本自动 APPEND 回已发送并同步进索引
+- POST /api/send                         发邮件（SMTP，multipart/form-data）：to(必填)/cc/subject/body/reply_folder/reply_uid/draft_folder/draft_uid/files[]；副本自动 APPEND 回已发送并同步进索引，带 draft_uid 时顺手清掉草稿
+- POST /api/drafts                       存草稿（JSON）；body: {to, cc, subject, body, draft_folder, draft_uid}；带 draft_uid 时替换上一版，不会堆积
+- POST /api/compose/ai                   AI 写正文（JSON）；body: {to, cc, subject, body, recent}；读收件人最近 N 封往来邮件 + 当前草稿，返回 3 个场景方案 {options:[{title,body}]}
+- GET  /api/config/ai                    读 AI 配置（密钥打码），来源 config/app.toml
+- PUT  /api/config/ai                    改 AI 配置；body: {enabled, base_url, api_key, model, temperature, timeout, recent_count, context_chars}（api_key 留空=不改）
+- POST /api/config/ai/test               测试 AI 接口连通性
 - GET  /api/search?q=...                 全文搜索（主题/发件人/收件人/正文）
 - GET  /api/threads                      会话列表；参数 folder/since/until/q/unread_only/boring/category/only_grouped/limit/offset/preview
 - GET  /api/threads/{thread_id}          单条会话全文（按时间顺序，含每封正文与附件）

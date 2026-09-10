@@ -950,6 +950,56 @@ body {
   margin-top: 4px;
 }
 .compose-status { flex: 1; font-size: 11.5px; color: #d9534f; overflow-wrap: anywhere; }
+.compose-status.is-ok { color: var(--ok); }
+.draft-status { font-size: 11px; color: var(--text-faint); white-space: nowrap; }
+.btn-sm { padding: 3px 10px; font-size: 11.5px; }
+
+/* ---- AI 写正文 ---- */
+.btn-ai { border-color: var(--accent); color: var(--accent); }
+.btn-ai:hover { background: var(--accent-soft); }
+.btn-ai:disabled { opacity: 0.6; cursor: progress; }
+.ai-opts {
+  display: flex; flex-direction: column; gap: 8px;
+  border: var(--border-w) dashed var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  padding: 10px 11px;
+}
+.ai-opts-head { font-size: 11.5px; color: var(--text-faint); }
+.ai-opt {
+  display: grid; gap: 6px;
+  border: var(--border-w) solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+  padding: 9px 10px;
+}
+.ai-opt-title { font-size: 12.5px; font-weight: var(--weight-head); color: var(--accent); }
+.ai-opt-body {
+  font-size: 12px; line-height: 1.55; color: var(--text-dim);
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  max-height: 132px; overflow-y: auto;
+}
+.ai-opt .btn { justify-self: start; }
+
+/* ---- 设置弹窗 ---- */
+#settingsForm {
+  display: flex; flex-direction: column; gap: 11px;
+  padding: 15px 18px 16px;
+  overflow-y: auto;
+}
+.settings-hint { margin: 0; font-size: 11.5px; line-height: 1.7; color: var(--text-faint); }
+.settings-hint code, .settings-meta code {
+  font-family: var(--font-mono); font-size: 11px;
+  background: var(--accent-soft); color: var(--accent);
+  padding: 1px 5px; border-radius: var(--radius-sm);
+}
+.field { display: flex; flex-direction: column; gap: 4px; }
+.field > span { font-size: 11.5px; color: var(--text-dim); }
+.field-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 9px; }
+@media (max-width: 560px) { .field-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.switch { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--text-dim); }
+.switch input { accent-color: var(--accent); }
+.settings-meta { font-size: 11px; color: var(--text-faint); overflow-wrap: anywhere; }
 
 /* ============================================================
    微信统计视图（新页签）
