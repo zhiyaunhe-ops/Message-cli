@@ -1,0 +1,9 @@
+{
+  "apps": {
+    "mail": {
+      "local_port": 8791,
+      "tailnet_port": 443,
+      "note": "邮件 WebUI"
+    }
+  }
+}
