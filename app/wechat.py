@@ -113,16 +113,16 @@ def _app_ctx():
 
 
 def _cached(key, ttl=CACHE_TTL):
-    return ctx.cache_get(_CACHE_PREFIX + str(key))
+    return ctx.cache.get(_CACHE_PREFIX + str(key))
 
 
 def _put(key, value, ttl=CACHE_TTL):
-    return ctx.cache_put(_CACHE_PREFIX + str(key), value, ttl)
+    return ctx.cache.put(_CACHE_PREFIX + str(key), value, ttl)
 
 
 def invalidate() -> int:
     """只清微信的缓存（邮件侧缓存不受影响）。"""
-    return ctx.cache_invalidate(_CACHE_PREFIX)
+    return ctx.cache.invalidate(_CACHE_PREFIX)
 
 
 # ---------------------------------------------------------------- 状态
@@ -469,6 +469,122 @@ def chat_history(chat: str, days: int | None = 7, limit: int = 50) -> dict:
         "total": len(items),
         "items": items,
     }
+
+
+def recent(limit: int = 20, days: int | None = 7) -> dict:
+    """跨全部会话的最新消息流（时间窗内按时间倒序），供统计页「最新消息」面板。"""
+    key = ("recent", days, limit)
+    hit = _cached(key)
+    if hit:
+        return hit
+
+    app = _app_ctx()
+    m = _load_mods()
+    names = m["get_contact_names"](app.cache, app.decrypted_dir)
+    disp = app.display_name_fn
+    self_user = m["get_self_username"](app.db_dir, app.cache, app.decrypted_dir)
+    start_ts, end_ts = window(days)
+    today_label = datetime.now().strftime("%m-%d")
+
+    def _dn(u: str) -> str:
+        try:
+            return disp(u, names) or u
+        except Exception:
+            return names.get(u, u)
+
+    rows: list[tuple] = []
+    with _lock:
+        hit = _cached(key)
+        if hit:
+            return hit
+        for rel in app.msg_db_keys:
+            path = app.cache.get(rel)
+            if not path:
+                continue
+            try:
+                with closing(sqlite3.connect(path)) as conn:
+                    id2u = m["_load_name2id_maps"](conn)
+                    hash2u = {hashlib.md5(u.encode()).hexdigest(): u
+                              for u in set(id2u.values())}
+                    tbl_names = [
+                        r[0] for r in conn.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'"
+                        )
+                    ]
+                    where, params = [], []
+                    if start_ts is not None:
+                        where.append("create_time >= ?")
+                        params.append(start_ts)
+                    if end_ts is not None:
+                        where.append("create_time <= ?")
+                        params.append(end_ts)
+                    wsql = f"WHERE {' AND '.join(where)}" if where else ""
+                    for t in tbl_names:
+                        if not _TABLE_RE.fullmatch(t):
+                            continue
+                        username = hash2u.get(t[4:], "")
+                        is_group = "@chatroom" in username
+                        try:
+                            for r in conn.execute(
+                                f"SELECT local_id, local_type, create_time, real_sender_id,"
+                                f"       message_content, WCDB_CT_message_content FROM [{t}] {wsql}"
+                                f" ORDER BY create_time DESC LIMIT ?",
+                                (*params, max(limit, 10)),
+                            ).fetchall():
+                                rows.append((r, username, is_group, id2u))
+                        except sqlite3.Error:
+                            continue
+            except Exception:
+                continue
+
+        rows.sort(key=lambda x: x[0][2], reverse=True)
+        rows = rows[:limit]
+        items = []
+        for (local_id, local_type, ts, sid, content, ct), username, is_group, id2u in rows:
+            if not username:
+                continue
+            text = m["decompress_content"](content, ct)
+            if text is None:
+                text = "(无法解压)"
+            chat_name = _dn(username)
+            _, body = m["_format_message_text"](
+                local_id, local_type, text, is_group, username, chat_name, names, disp,
+            )
+            try:
+                who = m["_resolve_sender_label"](
+                    sid, "", is_group, username, chat_name, names, id2u, disp,
+                ) or ""
+            except Exception:
+                who = ""
+            su = id2u.get(sid) if sid else None
+            mine = su == self_user or (not is_group and not sid)
+            who_disp = "" if mine else who
+            if who_disp == chat_name:  # 单聊里 sender 就是会话名，名字列已展示
+                who_disp = ""
+            dt = datetime.fromtimestamp(ts)
+            time_label = dt.strftime("%m-%d %H:%M")
+            if time_label.startswith(today_label):
+                time_label = "今天 " + time_label[6:]
+            items.append(
+                {
+                    "chat": chat_name,
+                    "username": username,
+                    "is_group": is_group,
+                    "sender": who_disp,
+                    "mine": mine,
+                    "time": time_label,
+                    "timestamp": ts,
+                    "type": m["format_msg_type"](local_type),
+                    "text": (body or "")[:120],
+                }
+            )
+        out = {
+            "days": days,
+            "range": _range_label(start_ts, end_ts),
+            "total": len(items),
+            "items": items,
+        }
+        return _put(key, out)
 
 
 def chat_stats(chat: str, days: int | None = 7) -> dict:

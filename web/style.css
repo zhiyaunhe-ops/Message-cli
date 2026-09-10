@@ -1057,6 +1057,13 @@ body[data-app="wechat"] #syncBtn { display: none; }
 .wx-last { color: var(--text-faint); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .wx-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); margin-right: 6px; vertical-align: 1px; }
 
+/* 最新消息流（左列底部） */
+.wx-recent { max-height: 520px; overflow-y: auto; }
+.wx-row.is-recent { grid-template-columns: 76px 1fr auto; }
+.wx-row.is-recent .rk { text-align: left; font-size: 11px; }
+.wx-row.is-recent .ct { font-size: 11px; max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wx-row.is-recent.is-mine .ct { color: var(--accent); }
+
 /* 会话详情 */
 .wx-detail { margin-top: 4px; }
 .wx-detail-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px; }

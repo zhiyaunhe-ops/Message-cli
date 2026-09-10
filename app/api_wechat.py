@@ -63,6 +63,18 @@ def wechat_history(
         raise HTTPException(status_code=404, detail=str(e))
 
 
+@router.get("/api/wechat/recent", summary="微信跨会话最新消息流")
+def wechat_recent(
+    days: int | None = Query(default=7, ge=0, le=3650),
+    limit: int = Query(default=20, ge=1, le=100),
+):
+    wx = _wx()
+    try:
+        return wx.recent(limit=limit, days=days or None)
+    except wx.WechatError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
 @router.get("/api/wechat/stats", summary="微信单个会话统计（类型 / 发言排行 / 24 小时）")
 def wechat_chat_stats(
     chat: str = Query(..., description="会话名 / 备注 / 微信号"),

@@ -1270,6 +1270,14 @@
     pHour.appendChild(wxBars(Object.entries(d.by_hour).map(([h, v]) => [h + "时", v])));
     left.appendChild(pHour);
 
+    // 左下空白区：跨会话最新消息流
+    const pRecent = wxPanel("最新消息", "加载中…");
+    const recentBox = el("div", "wx-rows wx-recent");
+    recentBox.appendChild(el("div", "wx-last", "加载中…"));
+    pRecent.appendChild(recentBox);
+    left.appendChild(pRecent);
+    loadWxRecent(pRecent.querySelector("h3 .sub"), recentBox);
+
     const pType = wxPanel("消息类型", d.by_type.length + " 类");
     pType.appendChild(wxTypes(d.by_type));
     right.appendChild(pType);
@@ -1281,6 +1289,38 @@
     grid.appendChild(left);
     grid.appendChild(right);
     body.appendChild(grid);
+  }
+
+  async function loadWxRecent(subEl, box) {
+    try {
+      const r = await api(`/api/wechat/recent?days=${state.wechat.days}&limit=20`);
+      if (subEl) subEl.textContent = r.range + " · 点击行看会话";
+      box.innerHTML = "";
+      if (!r.items.length) {
+        box.appendChild(el("div", "wx-last", "该时间窗内没有消息"));
+        return;
+      }
+      r.items.forEach((m) => {
+        const row = el("div", "wx-row is-recent");
+        if (m.mine) row.classList.add("is-mine");
+        row.appendChild(el("div", "rk", m.time));
+        const nm = el("div", "nm");
+        nm.appendChild(el("i", null, m.is_group ? "群" : "私"));
+        nm.appendChild(document.createTextNode(m.chat));
+        nm.title = m.chat + (m.sender && !m.mine ? " · " + m.sender : "");
+        row.appendChild(nm);
+        row.appendChild(el("div", "ct", m.mine ? "我 ↗" : (m.sender || "")));
+        const last = el("div", "wx-last");
+        last.style.gridColumn = "2 / -1";
+        last.textContent = m.text || `(${m.type})`;
+        row.appendChild(last);
+        row.addEventListener("click", () => openWxChat(m.username, m.chat, row));
+        box.appendChild(row);
+      });
+    } catch (e) {
+      if (subEl) subEl.textContent = "";
+      box.innerHTML = '<div class="wx-last">加载失败：' + esc(e.message) + "</div>";
+    }
   }
 
   async function loadWxSessions() {
